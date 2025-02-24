@@ -9,5 +9,6 @@ module.exports = {
   WEBHOOK_URL: process.env.WEBHOOK_URL || "",
   WEBHOOK_URL_VINCULO: process.env.WEBHOOK_URL_VINCULO || "",
   VALIDACAO_EAN_URL: process.env.VALIDACAO_EAN_URL || "",
+  SERVER_URL: process.env.SERVER_URL || "http://localhost:3000", // ✅ Adicione esta linha
   // Adicione outras configs, se necessário
 };
