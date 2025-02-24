@@ -15,10 +15,10 @@ const syncRoutes = require("./routes/syncRoutes");
 // ✅ CORS Middleware
 // =========================
 app.use(cors({
-    origin: process.env.SERVER_URL || "http://localhost:3000", // Usa SERVER_URL como origem principal
+    origin: '*', // ✅ Permite todas as origens
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
-    credentials: true // Caso precise enviar cookies ou autenticação
+    credentials: false // ❌ Removido o envio de cookies entre origens
 }));
 
 // Middleware para aceitar JSON
