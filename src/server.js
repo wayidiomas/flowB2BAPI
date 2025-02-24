@@ -1,8 +1,11 @@
 // src/server.js
+require("dotenv").config();
 const express = require("express");
-const cors = require("cors");
 const swaggerUi = require("swagger-ui-express");
 const swaggerJsDoc = require("swagger-jsdoc");
+
+// ✅ Importação do CORS Config
+const cors = require("cors");
 
 const app = express();
 const { PORT } = require("./config");
@@ -12,10 +15,15 @@ const syncRoutes = require("./routes/syncRoutes");
 // ✅ CORS Middleware
 // =========================
 app.use(cors({
-    origin: '*',
+    origin: process.env.SERVER_URL || "http://localhost:3000", // Usa SERVER_URL como origem principal
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: true // Caso precise enviar cookies ou autenticação
 }));
+
+// Middleware para aceitar JSON
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 // =========================
 // Swagger Configuration
@@ -28,7 +36,7 @@ const swaggerOptions = {
             version: "1.0.0",
             description: "API para sincronização de dados do Bling e Supabase"
         },
-        servers: [{ url: process.env.SERVER_URL || "http://localhost:3000" }] // ✅ Ajustado para o Render
+        servers: [{ url: process.env.SERVER_URL || "http://localhost:3000" }]
     },
     apis: ["./src/routes/*.js"]
 };
