@@ -11,7 +11,7 @@ const supabase = require("./supabaseService");
 // =========================
 
 async function syncWithPagination(url, body, empresa_id, refresh_token, useQuantity = false) {
-    let nextPage = 173;
+    let nextPage = 1;
     let quantidade = 100;
     let isPaginationFinished = false; // Flag para encerrar o loop
 
@@ -564,12 +564,12 @@ async function executeDailySync(empresa_id, access_token, refresh_token) {
     const data_inicial = formatDate(oneDayAgo);
     const data_final = formatDate(today);
 
-    /*await step1_syncUltimosProdutos(empresa_id, access_token, refresh_token, data_inicial, data_final);
+    await step1_syncUltimosProdutos(empresa_id, access_token, refresh_token, data_inicial, data_final);
     await step2_syncFornecedores(empresa_id, access_token, refresh_token);
     await step3_syncVendasAtuais(empresa_id, access_token, refresh_token);
     await step4_syncDetalhesVendas(empresa_id, access_token, refresh_token);
     await step5_syncPedidosCompra(empresa_id, access_token, refresh_token);
-    */
+    
     await step6_syncNotasFiscais(empresa_id, access_token, refresh_token);
 
     console.log("✅ [Daily] Todas as etapas de sincronização diária foram concluídas com sucesso!");

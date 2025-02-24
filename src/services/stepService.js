@@ -13,7 +13,7 @@ const TIME_80s = 80_000;
 // =========================
 
 async function syncWithPagination(url, body, empresa_id, refresh_token, useQuantity = false) {
-    let nextPage = 173;
+    let nextPage = 1;
     let quantidade = 100;
     let isPaginationFinished = false; // Flag para encerrar o loop
 
@@ -104,7 +104,7 @@ async function etapaPedidosVenda(empresa_id, accessToken, refresh_token) {
     let iterationDate = new Date(currentDate);
 
     // 🔹 Loop de sincronização diaria de pedidos de venda
-    /*
+    
     await executeWithRetry(async (token) => {
         while (iterationDate >= oneYearAgo) {
             const data_dia = iterationDate.toISOString().split('T')[0]; // Formata a data como "YYYY-MM-DD"
@@ -129,7 +129,7 @@ async function etapaPedidosVenda(empresa_id, accessToken, refresh_token) {
             await delay(5000); // ✅ Delay de 5 segundos após cada requisição
         }
     }, empresa_id, accessToken, refresh_token);
-    */
+    
    
 
     // 🔹 Loop de sincronização semanal de detalhes dos pedidos de venda
@@ -463,22 +463,22 @@ async function executeSteps(empresa_id, accessToken, refresh_token, paginaAtual 
         
         console.log(`🚀 Iniciando sincronização em etapas para empresa ${empresa_id}, página inicial: ${paginaAtual}`);
         const token = await getValidBlingToken(empresa_id, accessToken, refresh_token);
-        /*
+        
         await etapaProdutos(empresa_id, token, refresh_token, paginaAtual);
         await delay(TIME_80s);
 
         await etapaFornecedores(empresa_id, token, refresh_token);
         await delay(TIME_80s);
-        */
+        
 
-        /*
+        
         await etapaPedidosVenda(empresa_id, token, refresh_token);
         await delay(TIME_80s);
-        */
-        /*
+        
+        
         await etapaPedidosCompra(empresa_id, token, refresh_token);
         await delay(TIME_80s);
-        */
+        
         await etapaNotasFiscais(empresa_id, token, refresh_token);
 
         console.log("✅ Sincronização concluída com sucesso!");
