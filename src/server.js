@@ -12,13 +12,10 @@ const syncRoutes = require("./routes/syncRoutes");
 // ✅ CORS Middleware
 // =========================
 app.use(cors({
-    origin: '*', // ✅ Permite todas as origens (ou especifique o domínio do seu frontend)
+    origin: '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-    credentials: true
+    allowedHeaders: ['Content-Type', 'Authorization']
 }));
-
-app.use(express.json());
 
 // =========================
 // Swagger Configuration
