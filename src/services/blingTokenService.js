@@ -2,6 +2,8 @@ const axios = require("axios");
 const FormData = require("form-data");
 const supabase = require("./supabaseService");
 
+const TOKEN_EXPIRATION_BUFFER = 30 * 60 * 1000; // 30 minutos em milissegundos
+
 // =========================
 // Função para Inserir ou Atualizar Token no Supabase
 // =========================
@@ -17,7 +19,7 @@ async function upsertBlingToken(empresa_id, access_token, refresh_token, expires
         refresh_token,
         expires_at,
       },
-      { onConflict: ["empresa_id"] } // Garante atualização se já existir
+      { onConflict: ["empresa_id"] }
     );
 
     if (error) throw error;
@@ -62,7 +64,6 @@ async function refreshBlingToken(empresa_id, currentRefreshToken) {
 
     console.log(`✅ Novo access_token obtido: ${access_token}`);
 
-    // Atualiza ou insere o token no Supabase
     await upsertBlingToken(empresa_id, access_token, refresh_token, expires_at);
 
     return { access_token, refresh_token, expires_at };
@@ -73,7 +74,7 @@ async function refreshBlingToken(empresa_id, currentRefreshToken) {
 }
 
 // =========================
-// Função para Retornar o Token Válido
+// Função para Retornar o Token Válido (com renovação antecipada)
 // =========================
 
 async function getValidBlingToken(empresa_id, accessToken = null, refresh_token = null) {
@@ -84,19 +85,23 @@ async function getValidBlingToken(empresa_id, accessToken = null, refresh_token 
       .from("bling_tokens")
       .select("access_token, refresh_token, expires_at")
       .eq("empresa_id", empresa_id)
-      .maybeSingle(); // Permite null se não encontrar
+      .maybeSingle();
 
-    // Se não existir, insere usando os dados recebidos no primeiro uso
+    if (error) throw error;
+
     if (!data) {
       console.log("💾 Token não encontrado. Inserindo no banco de dados...");
-      await upsertBlingToken(empresa_id, accessToken, refresh_token, new Date(Date.now() + 3600 * 1000));
-      return accessToken; // Retorna o token enviado
+      const expires_at = new Date(Date.now() + 3600 * 1000); // 1 hora
+      await upsertBlingToken(empresa_id, accessToken, refresh_token, expires_at);
+      return accessToken;
     }
 
-    // Se o token estiver expirado, atualiza
-    const tokenExpirado = new Date(data.expires_at) <= new Date();
-    if (tokenExpirado) {
-      console.log("💡 Token expirado. Atualizando...");
+    const expiresAt = new Date(data.expires_at);
+    const now = new Date();
+    const shouldRefresh = expiresAt.getTime() - now.getTime() <= TOKEN_EXPIRATION_BUFFER;
+
+    if (shouldRefresh) {
+      console.log("💡 Token expira em menos de 30 minutos. Atualizando...");
       const newToken = await refreshBlingToken(empresa_id, refresh_token || data.refresh_token);
       return newToken.access_token;
     }
@@ -112,5 +117,5 @@ async function getValidBlingToken(empresa_id, accessToken = null, refresh_token 
 module.exports = {
   refreshBlingToken,
   getValidBlingToken,
-  upsertBlingToken, // ✅ Exportado para outros usos
+  upsertBlingToken,
 };

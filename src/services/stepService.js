@@ -69,7 +69,7 @@ async function etapaProdutos(empresa_id, accessToken, refresh_token) {
 async function etapaFornecedores(empresa_id, accessToken, refresh_token) {
     
     console.log("🚀 [Etapa 2] Iniciando sincronização de Fornecedores e Detalhes");
-
+    
     await executeWithRetry(async (token) => {
         await syncWithPagination(
             `${process.env.SUPABASE_URL}/functions/v1/sync_fornecedor_by_productID`,
@@ -77,7 +77,7 @@ async function etapaFornecedores(empresa_id, accessToken, refresh_token) {
             empresa_id, refresh_token
         );
     }, empresa_id, accessToken, refresh_token);
-
+    
     await executeWithRetry(async (token) => {
         await syncWithPagination(
             `${process.env.SUPABASE_URL}/functions/v1/detalhes_fornecedor`,
@@ -466,7 +466,7 @@ async function executeSteps(empresa_id, accessToken, refresh_token, paginaAtual 
         
         await etapaProdutos(empresa_id, token, refresh_token, paginaAtual);
         await delay(TIME_80s);
-
+        
         await etapaFornecedores(empresa_id, token, refresh_token);
         await delay(TIME_80s);
         
