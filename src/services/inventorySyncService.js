@@ -1,7 +1,7 @@
 require("dotenv").config();
 const { delay, callWithNextPage } = require("../utils/pagination");
 const { getValidBlingToken } = require("./blingTokenService");
-const { executeWithRetry } = require("./retryService"); // ✅ Importação adicionada
+const { executeWithRetry } = require("./retryService");
 const supabase = require("./supabaseService");
 
 // =========================
@@ -11,7 +11,7 @@ const supabase = require("./supabaseService");
 async function syncEstoqueWithPagination(empresa_id, access_token, refresh_token) {
     console.log("🔄 [Inventory] Sincronizando estoque...");
 
-    let nextPage = 1;
+    let nextPage = 1; // ✅ Inicia automaticamente com a página 1
 
     while (nextPage !== null) {
         await executeWithRetry(async (token) => {
@@ -20,8 +20,8 @@ async function syncEstoqueWithPagination(empresa_id, access_token, refresh_token
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                     access_token: token,
-                    empresa_id: Number(empresa_id), // ✅ Garantir que seja um número
-                    page: nextPage,
+                    empresa_id: Number(empresa_id),
+                    page: nextPage || 1, // ✅ Caso `nextPage` seja null, inicia com 1 automaticamente
                 }),
             });
 
@@ -33,8 +33,8 @@ async function syncEstoqueWithPagination(empresa_id, access_token, refresh_token
             const data = await response.json();
             console.log(`Estoque - Página ${nextPage} sincronizada.`);
 
-            nextPage = data.next_page ?? null;
-            await delay(5000); // ✅ Delay de 5 segundos após cada requisição
+            nextPage = data.next_page ?? null; // ✅ Atualiza a página conforme o `next_page` da resposta
+            await delay(5000);
         }, access_token, refresh_token);
     }
 
@@ -48,7 +48,6 @@ async function syncEstoqueWithPagination(empresa_id, access_token, refresh_token
 async function executeInventorySync(empresa_id, access_token, refresh_token) {
     console.log(`\n🚀 [Inventory] Iniciando sincronização de estoque para empresa ${empresa_id}`);
 
-    // ✅ Correção: Ordem correta dos parâmetros
     access_token = await getValidBlingToken(Number(empresa_id), access_token, refresh_token);
 
     await syncEstoqueWithPagination(empresa_id, access_token, refresh_token);
