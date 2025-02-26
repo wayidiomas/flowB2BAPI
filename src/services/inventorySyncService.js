@@ -4,38 +4,52 @@ const { getValidBlingToken } = require("./blingTokenService");
 const { executeWithRetry } = require("./retryService");
 const supabase = require("./supabaseService");
 
+const TIME_5s = 5000; // ✅ Delay configurável
+
 // =========================
 // Função Auxiliar
 // =========================
 
-async function syncEstoqueWithPagination(empresa_id, access_token, refresh_token) {
+async function syncEstoqueWithPagination(empresa_id, refresh_token) {
     console.log("🔄 [Inventory] Sincronizando estoque...");
 
     let nextPage = 1; // ✅ Inicia automaticamente com a página 1
+    let isPaginationFinished = false; // ✅ Flag para encerrar o loop
 
-    while (nextPage !== null) {
+    while (!isPaginationFinished) {
         await executeWithRetry(async (token) => {
+            console.log(`➡️ [Inventory] Iniciando requisição - Página ${nextPage}`);
+            console.log(`🔑 [Inventory] Token usado: ${token}`);
+
+            const payload = {
+                access_token: token,
+                empresa_id: Number(empresa_id),
+                page: nextPage || 1,
+            };
+
+            console.log(`📤 [Inventory] Payload enviado:`, payload);
+
             const response = await global.fetch(`${process.env.SUPABASE_URL}/functions/v1/sync_estoque`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    access_token: token,
-                    empresa_id: Number(empresa_id),
-                    page: nextPage || 1, // ✅ Caso `nextPage` seja null, inicia com 1 automaticamente
-                }),
+                body: JSON.stringify(payload),
             });
 
             if (!response.ok) {
                 const errorText = await response.text();
+                console.error(`🔥 [Inventory] Erro ao sincronizar estoque - Página ${nextPage}: ${response.status} - ${errorText}`);
                 throw new Error(`Erro ao sincronizar estoque - Página ${nextPage}: ${response.status} - ${errorText}`);
             }
 
             const data = await response.json();
-            console.log(`Estoque - Página ${nextPage} sincronizada.`);
+            console.log(`✅ [Inventory] Estoque - Página ${nextPage} sincronizada.`);
 
-            nextPage = data.next_page ?? null; // ✅ Atualiza a página conforme o `next_page` da resposta
-            await delay(5000);
-        }, access_token, refresh_token);
+            nextPage = data.next_page ?? null;
+            isPaginationFinished = nextPage === null;
+
+            console.log(`⏸️ [Inventory] Delay de ${TIME_5s / 1000}s antes da próxima página...`);
+            await delay(TIME_5s);
+        }, empresa_id, null, refresh_token); // ✅ Passa empresa_id e refresh_token para garantir o refresh automático
     }
 
     console.log("✅ [Inventory] Sincronização de estoque concluída.");
@@ -48,9 +62,12 @@ async function syncEstoqueWithPagination(empresa_id, access_token, refresh_token
 async function executeInventorySync(empresa_id, access_token, refresh_token) {
     console.log(`\n🚀 [Inventory] Iniciando sincronização de estoque para empresa ${empresa_id}`);
 
-    access_token = await getValidBlingToken(Number(empresa_id), access_token, refresh_token);
+    // ✅ Obtém o token apenas uma vez antes do loop
+    const token = await getValidBlingToken(Number(empresa_id), access_token, refresh_token);
+    console.log(`🔑 [Inventory] Token obtido: ${token}`);
 
-    await syncEstoqueWithPagination(empresa_id, access_token, refresh_token);
+    // ✅ Chama a função de sincronização passando apenas refresh_token
+    await syncEstoqueWithPagination(empresa_id, refresh_token);
 
     console.log("✅ [Inventory] Sincronização de estoque concluída com sucesso!");
     return { success: true, message: "Inventory sync completed" };
