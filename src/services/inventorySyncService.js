@@ -1,8 +1,7 @@
 require("dotenv").config();
-const { delay, callWithNextPage } = require("../utils/pagination");
+const { delay } = require("../utils/pagination");
 const { getValidBlingToken } = require("./blingTokenService");
 const { executeWithRetry } = require("./retryService");
-const supabase = require("./supabaseService");
 
 const TIME_5s = 5000; // ✅ Delay configurável
 
@@ -10,7 +9,7 @@ const TIME_5s = 5000; // ✅ Delay configurável
 // Função Auxiliar
 // =========================
 
-async function syncEstoqueWithPagination(empresa_id, refresh_token) {
+async function syncEstoqueWithPagination(empresa_id, access_token, refresh_token) {
     console.log("🔄 [Inventory] Sincronizando estoque...");
 
     let nextPage = 1; // ✅ Inicia automaticamente com a página 1
@@ -49,7 +48,7 @@ async function syncEstoqueWithPagination(empresa_id, refresh_token) {
 
             console.log(`⏸️ [Inventory] Delay de ${TIME_5s / 1000}s antes da próxima página...`);
             await delay(TIME_5s);
-        }, empresa_id, null, refresh_token); // ✅ Passa empresa_id e refresh_token para garantir o refresh automático
+        }, empresa_id, access_token, refresh_token); // ✅ Agora passa o `accessToken` inicial corretamente
     }
 
     console.log("✅ [Inventory] Sincronização de estoque concluída.");
@@ -66,8 +65,8 @@ async function executeInventorySync(empresa_id, access_token, refresh_token) {
     const token = await getValidBlingToken(Number(empresa_id), access_token, refresh_token);
     console.log(`🔑 [Inventory] Token obtido: ${token}`);
 
-    // ✅ Chama a função de sincronização passando apenas refresh_token
-    await syncEstoqueWithPagination(empresa_id, refresh_token);
+    // ✅ Chama a função de sincronização passando o `accessToken` inicial
+    await syncEstoqueWithPagination(empresa_id, token, refresh_token);
 
     console.log("✅ [Inventory] Sincronização de estoque concluída com sucesso!");
     return { success: true, message: "Inventory sync completed" };
