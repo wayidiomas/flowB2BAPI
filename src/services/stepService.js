@@ -262,6 +262,7 @@ async function etapaNotasFiscais(empresa_id, accessToken, refresh_token) {
     let iterationDate = new Date(currentDate);
 
      // 🔹 Loop de sincronização mensal de últimas compras
+     
      await executeWithRetry(async (token) => {
         console.log("🔁 [Últimas Compras] Iniciando loop mensal...");
         while (iterationDate >= oneYearAgo) {
@@ -360,7 +361,7 @@ async function etapaNotasFiscais(empresa_id, accessToken, refresh_token) {
     }
 }
 
-
+    
     // 🔁 [Detalhamento de Produtos] Sincronização
     console.log("🔁 [Detalhamento de Produtos] Iniciando sincronização...");
 

@@ -3,7 +3,7 @@ const { delay } = require("../utils/pagination");
 const { getValidBlingToken } = require("./blingTokenService");
 const { executeWithRetry } = require("./retryService");
 
-const TIME_5s = 5000; // ✅ Delay configurável
+const TIME_5s = 10000; // ✅ Delay configurável
 
 // =========================
 // Função Auxiliar
