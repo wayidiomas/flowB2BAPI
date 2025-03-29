@@ -435,10 +435,10 @@ async function step6_syncNotasFiscais(empresa_id, access_token, refresh_token) {
     console.log("🔄 [Daily] Etapa 6: Sincronizar Notas Fiscais...");
 
     const today = new Date();
-    const oneDayAgo = new Date(today);
-    oneDayAgo.setDate(today.getDate() - 1);
+    const oneMonthAgo = new Date(today);
+    oneMonthAgo.setMonth(today.getMonth() - 1);
 
-    const data_inicial = formatDate(oneDayAgo);
+    const data_inicial = formatDate(oneMonthAgo);
     const data_final = formatDate(today);
 
     // ✅ Sincronizar últimas compras
