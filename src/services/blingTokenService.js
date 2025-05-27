@@ -1,8 +1,14 @@
+// src/services/blingTokenService.js
 const axios = require("axios");
 const FormData = require("form-data");
 const supabase = require("./supabaseService");
 
-const TOKEN_EXPIRATION_BUFFER = 30 * 60 * 1000*2; // 30 minutos em milissegundos
+// Alterado para 60 minutos (1 hora) em milissegundos
+const TOKEN_RENEWAL_INTERVAL = 60 * 60 * 1000; // 1 hora em milissegundos
+const TOKEN_EXPIRATION_BUFFER = 30 * 60 * 1000 * 2; // 30 minutos em milissegundos (mantido para compatibilidade)
+
+// Guarda intervalos de renovação por empresa
+const renewalIntervals = {};
 
 // =========================
 // Função para Inserir ou Atualizar Token no Supabase
@@ -25,10 +31,37 @@ async function upsertBlingToken(empresa_id, access_token, refresh_token, expires
     if (error) throw error;
 
     console.log(`✅ Token salvo com sucesso.`);
+    
+    // Agenda a próxima renovação automática
+    scheduleTokenRenewal(empresa_id, refresh_token);
+    
   } catch (error) {
     console.error("❌ Erro ao salvar token do Bling:", error.message || error);
     throw error;
   }
+}
+
+// =========================
+// Função para Agendar Renovação de Token
+// =========================
+
+function scheduleTokenRenewal(empresa_id, refresh_token) {
+  // Limpa qualquer intervalo existente para esta empresa
+  if (renewalIntervals[empresa_id]) {
+    clearInterval(renewalIntervals[empresa_id]);
+  }
+  
+  console.log(`⏰ Agendando renovação periódica do token para empresa ${empresa_id} a cada ${TOKEN_RENEWAL_INTERVAL / 60000} minutos...`);
+  
+  // Agenda a renovação periódica a cada hora
+  renewalIntervals[empresa_id] = setInterval(async () => {
+    try {
+      console.log(`⏰ Executando renovação agendada do token para empresa ${empresa_id}...`);
+      await refreshBlingToken(empresa_id, refresh_token);
+    } catch (error) {
+      console.error(`❌ Erro durante renovação agendada do token para empresa ${empresa_id}:`, error.message || error);
+    }
+  }, TOKEN_RENEWAL_INTERVAL);
 }
 
 // =========================
@@ -92,7 +125,7 @@ async function getValidBlingToken(empresa_id, accessToken = null, refresh_token 
     // 🔹 Se não houver token ou expires_at, forçamos uma atualização
     if (!data || !data.expires_at) {
       console.log("⚠️ Nenhuma data de expiração encontrada. Forçando atualização do token...");
-      const newToken = await refreshBlingToken(empresa_id, refresh_token || data.refresh_token);
+      const newToken = await refreshBlingToken(empresa_id, refresh_token || data?.refresh_token);
       return newToken.access_token;
     }
 
@@ -111,6 +144,9 @@ async function getValidBlingToken(empresa_id, accessToken = null, refresh_token 
       return newToken.access_token;
     }
 
+    // Garante que a renovação periódica esteja agendada
+    scheduleTokenRenewal(empresa_id, data.refresh_token);
+
     console.log("✅ Token válido encontrado.");
     return data.access_token;
   } catch (error) {
@@ -119,8 +155,16 @@ async function getValidBlingToken(empresa_id, accessToken = null, refresh_token 
   }
 }
 
+// Função para limpar todos os intervalos (útil para encerramento limpo do servidor)
+function clearAllRenewalIntervals() {
+  for (const empresa_id in renewalIntervals) {
+    clearInterval(renewalIntervals[empresa_id]);
+  }
+}
+
 module.exports = {
   refreshBlingToken,
   getValidBlingToken,
   upsertBlingToken,
+  clearAllRenewalIntervals,
 };

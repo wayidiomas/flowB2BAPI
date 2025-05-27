@@ -7,6 +7,9 @@ const swaggerJsDoc = require("swagger-jsdoc");
 // ✅ Importação do CORS Config
 const cors = require("cors");
 
+// ✅ Importação do serviço de limpeza de tokens
+const { clearAllRenewalIntervals } = require("./services/blingTokenService");
+
 const app = express();
 const { PORT } = require("./config");
 const syncRoutes = require("./routes/syncRoutes");
@@ -50,11 +53,43 @@ app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerDocs));
 app.use("/api/sync", syncRoutes);
 
 // =========================
+// Tratamento de encerramento limpo
+// =========================
+process.on('SIGTERM', () => {
+    console.log('🛑 SIGTERM recebido. Limpando intervalos de renovação de token...');
+    clearAllRenewalIntervals();
+    process.exit(0);
+});
+
+process.on('SIGINT', () => {
+    console.log('🛑 SIGINT recebido. Limpando intervalos de renovação de token...');
+    clearAllRenewalIntervals();
+    process.exit(0);
+});
+
+// =========================
 // Inicialização do servidor
 // =========================
 const port = PORT || 3000;
 
-app.listen(port, () => {
+const server = app.listen(port, () => {
     console.log(`✅ Server running on port ${port}`);
     console.log(`📜 Swagger Docs available at ${process.env.SERVER_URL || `http://localhost:${port}`}/api-docs`);
+});
+
+// Tratamento de erros não capturados
+process.on('uncaughtException', (error) => {
+    console.error('❌ Erro não capturado:', error);
+    clearAllRenewalIntervals();
+    server.close(() => {
+        process.exit(1);
+    });
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('❌ Rejeição não tratada:', reason);
+    clearAllRenewalIntervals();
+    server.close(() => {
+        process.exit(1);
+    });
 });
