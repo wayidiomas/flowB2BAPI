@@ -1,29 +1,55 @@
 // src/services/stepService.js
-
+require("dotenv").config();
 const supabase = require("./supabaseService");
-const dateUtils = require('../utils/dateUtils');
-const { callWithNextPage, delay } = require("../utils/pagination");
+const { formatDate } = require('../utils/dateUtils');
+const { getDelay, getRetryConfig, SYNC } = require("../config/SyncConfig");
+const delay = require("../utils/delay");
 const { getValidBlingToken } = require("./blingTokenService");
-const { executeWithAdvancedRetry } = require("./retryService");
 const { callEdgeFunction } = require("./edgeFunctionService");
+const { getSyncMetrics } = require("./metricsService");
+const { 
+    createSyncContext, 
+    logOperationStart, 
+    logOperationEnd, 
+    logError,
+    logPaginationProgress 
+} = require("../utils/logger");
 
-const TIME_80s = 80_000;
+// ===========================
+// FUNÇÕES AUXILIARES DE PAGINAÇÃO
+// ===========================
 
-// =========================
-// Funções Auxiliares de Paginação
-// =========================
-
-async function syncWithPagination(url, body, empresa_id, refresh_token, useQuantity = false) {
+/**
+ * Função unificada de paginação com logging e métricas integradas
+ */
+async function syncWithPagination(url, body, empresa_id, refresh_token, useQuantity = false, stepName = 'unknown') {
     let nextPage = 1;
     let quantidade = 100;
-    let isPaginationFinished = false; // Flag para encerrar o loop
+    let isPaginationFinished = false;
+    let totalRecordsProcessed = 0;
+    
+    const logger = createSyncContext(empresa_id, 'first-time', stepName);
+    const metrics = getSyncMetrics(empresa_id, 'first-time');
+
+    logger.info('Iniciando paginação', {
+        stepName,
+        url: url.split('/').pop(),
+        useQuantity,
+        startPage: nextPage
+    });
 
     while (!isPaginationFinished) {
         try {
-            // Atualiza a página no payload
+            // Prepara o payload com a página atual
             const payload = { ...body, page: nextPage };
             
-            // Usa o novo serviço de Edge Function com retry
+            logger.debug('Iniciando requisição de página', {
+                stepName,
+                page: nextPage,
+                useQuantity
+            });
+            
+            // Usa o novo serviço de Edge Function com retry e rate limiting
             const result = await callEdgeFunction(
                 url,
                 payload,
@@ -31,179 +57,487 @@ async function syncWithPagination(url, body, empresa_id, refresh_token, useQuant
                 body.access_token,
                 refresh_token,
                 {
+                    context: 'default',
                     maxRetries: 20,
                     initialDelay: 2000,
                     backoffFactor: 1.5
                 }
             );
-            
-            // Determina se a paginação deve continuar com base no modo de paginação
+
+            // Registra progresso nas métricas se disponíveis
+            if (metrics) {
+                const recordCount = result?.data?.length || result?.quantidade || 0;
+                metrics.pageProcessed(nextPage, recordCount);
+                totalRecordsProcessed += recordCount;
+            }
+
+            // Log de progresso
+            logPaginationProgress(nextPage, totalRecordsProcessed, stepName, {
+                empresa_id,
+                syncType: 'first-time'
+            });
+
+            // Lógica de paginação dependendo do modo
             if (useQuantity) {
                 quantidade = result?.quantidade ?? 0;
                 if (quantidade < 100) {
-                    isPaginationFinished = true; // Finaliza quando a quantidade for menor que 100
-                    console.log(`🏁 Paginação concluída: quantidade (${quantidade}) < 100`);
+                    logger.info('Paginação finalizada por quantidade', {
+                        stepName,
+                        quantidade,
+                        totalPages: nextPage,
+                        totalRecords: totalRecordsProcessed
+                    });
+                    isPaginationFinished = true;
                 } else {
                     nextPage++;
-                    console.log(`⏭️ Próxima página: ${nextPage}`);
+                    logger.debug('Avançando para próxima página', {
+                        stepName,
+                        nextPage,
+                        quantidade
+                    });
                 }
             } else {
                 nextPage = result?.next_page ?? null;
                 if (nextPage === null) {
-                    isPaginationFinished = true; // Finaliza quando não há mais páginas
-                    console.log(`🏁 Paginação concluída: next_page é null`);
+                    logger.info('Paginação finalizada por next_page null', {
+                        stepName,
+                        totalPages: nextPage || 1,
+                        totalRecords: totalRecordsProcessed
+                    });
+                    isPaginationFinished = true;
                 } else {
-                    console.log(`⏭️ Próxima página: ${nextPage}`);
+                    logger.debug('Próxima página identificada', {
+                        stepName,
+                        nextPage
+                    });
                 }
             }
             
-            // Delay entre requisições
+            // Delay entre páginas (só se ainda tiver mais páginas)
             if (!isPaginationFinished) {
-                console.log(`⏱️ Aguardando 50 segundos antes da próxima página...`);
-                await delay(50000);
+                const delayTime = getDelay('pagination');
+                logger.debug('Aplicando delay entre páginas', {
+                    stepName,
+                    delayTime: `${delayTime}ms`
+                });
+                await delay(delayTime);
             }
         } catch (error) {
-            console.error(`❌ Erro fatal durante a paginação:`, error);
-            throw error; // Propaga o erro após todas as tentativas de retry falharem
+            // Registra erro nas métricas
+            if (metrics) {
+                metrics.recordError(error, {
+                    stepName,
+                    page: nextPage,
+                    url: url.split('/').pop()
+                });
+            }
+            
+            logError(error, `syncWithPagination-${stepName}`, {
+                empresa_id,
+                page: nextPage,
+                url: url.split('/').pop()
+            });
+            
+            throw error;
         }
     }
+
+    logger.info('Paginação concluída', {
+        stepName,
+        totalRecords: totalRecordsProcessed,
+        totalPages: nextPage
+    });
+
+    return { totalRecordsProcessed, totalPages: nextPage };
 }
+
+// ===========================
+// ETAPA 1: PRODUTOS E DETALHES
+// ===========================
 
 async function etapaProdutos(empresa_id, accessToken, refresh_token, paginaAtual = 1) {
-    console.log("🚀 [Etapa 1] Iniciando sincronização de Produtos e Detalhes");
+    const stepName = 'produtos';
+    const logger = createSyncContext(empresa_id, 'first-time', stepName);
+    const metrics = getSyncMetrics(empresa_id, 'first-time');
+
+    logOperationStart(`firstTime-${stepName}`, { empresa_id, paginaAtual });
+    
+    if (metrics) {
+        metrics.startStep(stepName);
+    }
 
     try {
-        // Step 1: Sincronizar produtos usando quantidade (< 100 para encerrar)
-        console.log("🔍 [Etapa 1.1] Sincronizando produtos...");
-        await syncWithPagination(
+        logger.info('Iniciando sincronização de produtos e detalhes', {
+            stepName,
+            paginaAtual,
+            totalSubSteps: 2
+        });
+
+        // Sub-etapa 1.1: Sincronizar produtos usando quantidade (< 100 para encerrar)
+        logger.info('Sub-etapa 1.1: Sincronizando produtos', { stepName });
+        
+        const produtosResult = await syncWithPagination(
             `${process.env.SUPABASE_URL}/functions/v1/sync_prod_2`,
-            { empresa_id, access_token: accessToken, page: paginaAtual },
+            { 
+                empresa_id: Number(empresa_id), 
+                access_token: accessToken, 
+                page: paginaAtual 
+            },
             empresa_id, 
             refresh_token, 
-            true // ✅ Controla paginação usando 'quantidade'
+            true, // ✅ Controla paginação usando 'quantidade'
+            `${stepName}-sync`
         );
 
-        // Step 2: Sincronizar detalhes do produto usando next_page
-        console.log("🔍 [Etapa 1.2] Sincronizando detalhes dos produtos...");
-        await syncWithPagination(
+        logger.info('Sub-etapa 1.1 concluída', {
+            stepName,
+            totalRecords: produtosResult.totalRecordsProcessed,
+            totalPages: produtosResult.totalPages
+        });
+
+        // Delay entre sub-etapas
+        const miniDelayTime = getDelay('steps', 'mini');
+        logger.debug('Delay entre sub-etapas', {
+            stepName,
+            delayTime: `${miniDelayTime}ms`
+        });
+        await delay(miniDelayTime);
+
+        // Sub-etapa 1.2: Sincronizar detalhes do produto usando next_page
+        logger.info('Sub-etapa 1.2: Sincronizando detalhes dos produtos', { stepName });
+        
+        const detalhesResult = await syncWithPagination(
             `${process.env.SUPABASE_URL}/functions/v1/sync_detalhes_prod`,
-            { empresa_id, access_token: accessToken },
+            { 
+                empresa_id: Number(empresa_id), 
+                access_token: accessToken 
+            },
             empresa_id, 
             refresh_token, 
-            false // ✅ Controla paginação usando 'next_page'
+            false, // ✅ Controla paginação usando 'next_page'
+            `${stepName}-detalhes`
         );
 
-        console.log("✅ [Etapa 1] Produtos e Detalhes concluídos com sucesso.");
+        logger.info('Sub-etapa 1.2 concluída', {
+            stepName,
+            totalRecords: detalhesResult.totalRecordsProcessed,
+            totalPages: detalhesResult.totalPages
+        });
+
+        const finalStats = {
+            produtos: produtosResult,
+            detalhes: detalhesResult,
+            totalRecords: produtosResult.totalRecordsProcessed + detalhesResult.totalRecordsProcessed
+        };
+
+        if (metrics) {
+            metrics.endStep('completed');
+        }
+
+        logOperationEnd(`firstTime-${stepName}`, true, {
+            empresa_id,
+            ...finalStats
+        });
+
+        logger.info('Etapa de produtos concluída com sucesso', {
+            stepName,
+            ...finalStats
+        });
+
+        return finalStats;
+
     } catch (error) {
-        console.error("❌ [Etapa 1] Erro na sincronização de produtos:", error);
+        if (metrics) {
+            metrics.recordError(error, { stepName });
+            metrics.endStep('failed');
+        }
+
+        logOperationEnd(`firstTime-${stepName}`, false, {
+            empresa_id,
+            error: error.message
+        });
+
+        logError(error, `firstTime-${stepName}`, { empresa_id, paginaAtual });
         throw error;
     }
 }
 
-// =========================
-// Etapa 2: Fornecedores e Detalhes
-// =========================
+// ===========================
+// ETAPA 2: FORNECEDORES E DETALHES
+// ===========================
 
 async function etapaFornecedores(empresa_id, accessToken, refresh_token) {
-    console.log("🚀 [Etapa 2] Iniciando sincronização de Fornecedores e Detalhes");
+    const stepName = 'fornecedores';
+    const logger = createSyncContext(empresa_id, 'first-time', stepName);
+    const metrics = getSyncMetrics(empresa_id, 'first-time');
+
+    logOperationStart(`firstTime-${stepName}`, { empresa_id });
     
+    if (metrics) {
+        metrics.startStep(stepName);
+    }
+
     try {
-        // Sincroniza fornecedores por produto
-        console.log("🔍 [Etapa 2.1] Sincronizando fornecedores por produto...");
-        await syncWithPagination(
-            `${process.env.SUPABASE_URL}/functions/v1/sync_fornecedor_by_productID`,
-            { empresa_id, access_token: accessToken },
-            empresa_id, 
-            refresh_token
-        );
+        logger.info('Iniciando sincronização de fornecedores e detalhes', {
+            stepName,
+            totalSubSteps: 2
+        });
+
+        // Sub-etapa 2.1: Sincroniza fornecedores por produto
+        logger.info('Sub-etapa 2.1: Sincronizando fornecedores por produto', { stepName });
         
-        // Sincroniza detalhes dos fornecedores
-        console.log("🔍 [Etapa 2.2] Sincronizando detalhes dos fornecedores...");
-        await syncWithPagination(
-            `${process.env.SUPABASE_URL}/functions/v1/detalhes_fornecedor`,
-            { empresa_id, access_token: accessToken },
+        const fornecedoresResult = await syncWithPagination(
+            `${process.env.SUPABASE_URL}/functions/v1/sync_fornecedor_by_productID`,
+            { 
+                empresa_id: Number(empresa_id), 
+                access_token: accessToken 
+            },
             empresa_id, 
-            refresh_token
+            refresh_token,
+            false,
+            `${stepName}-sync`
         );
 
-        console.log("✅ [Etapa 2] Fornecedores e Detalhes concluídos com sucesso.");
+        logger.info('Sub-etapa 2.1 concluída', {
+            stepName,
+            totalRecords: fornecedoresResult.totalRecordsProcessed
+        });
+
+        // Delay entre sub-etapas
+        const miniDelayTime = getDelay('steps', 'mini');
+        await delay(miniDelayTime);
+        
+        // Sub-etapa 2.2: Sincroniza detalhes dos fornecedores
+        logger.info('Sub-etapa 2.2: Sincronizando detalhes dos fornecedores', { stepName });
+        
+        const detalhesResult = await syncWithPagination(
+            `${process.env.SUPABASE_URL}/functions/v1/detalhes_fornecedor`,
+            { 
+                empresa_id: Number(empresa_id), 
+                access_token: accessToken 
+            },
+            empresa_id, 
+            refresh_token,
+            false,
+            `${stepName}-detalhes`
+        );
+
+        logger.info('Sub-etapa 2.2 concluída', {
+            stepName,
+            totalRecords: detalhesResult.totalRecordsProcessed
+        });
+
+        const finalStats = {
+            fornecedores: fornecedoresResult,
+            detalhes: detalhesResult,
+            totalRecords: fornecedoresResult.totalRecordsProcessed + detalhesResult.totalRecordsProcessed
+        };
+
+        if (metrics) {
+            metrics.endStep('completed');
+        }
+
+        logOperationEnd(`firstTime-${stepName}`, true, {
+            empresa_id,
+            ...finalStats
+        });
+
+        logger.info('Etapa de fornecedores concluída com sucesso', {
+            stepName,
+            ...finalStats
+        });
+
+        return finalStats;
+
     } catch (error) {
-        console.error("❌ [Etapa 2] Erro na sincronização de fornecedores:", error);
+        if (metrics) {
+            metrics.recordError(error, { stepName });
+            metrics.endStep('failed');
+        }
+
+        logOperationEnd(`firstTime-${stepName}`, false, {
+            empresa_id,
+            error: error.message
+        });
+
+        logError(error, `firstTime-${stepName}`, { empresa_id });
         throw error;
     }
 }
 
-// =========================
-// Etapa 3: Pedidos de Venda e Detalhes
-// =========================
+// ===========================
+// ETAPA 3: PEDIDOS DE VENDA E DETALHES
+// ===========================
 
 async function etapaPedidosVenda(empresa_id, accessToken, refresh_token) {
-    console.log("🚀 [Etapa 3] Iniciando sincronização de Pedidos de Venda e Detalhes");
+    const stepName = 'pedidos-venda';
+    const logger = createSyncContext(empresa_id, 'first-time', stepName);
+    const metrics = getSyncMetrics(empresa_id, 'first-time');
+
+    logOperationStart(`firstTime-${stepName}`, { empresa_id });
+    
+    if (metrics) {
+        metrics.startStep(stepName);
+    }
 
     try {
         const currentDate = new Date();
         const oneYearAgo = new Date(currentDate);
-        oneYearAgo.setFullYear(currentDate.getFullYear() - 1);
+        oneYearAgo.setFullYear(currentDate.getFullYear() - SYNC.FIRST_TIME_PERIOD_MONTHS / 12);
 
-        let iterationDate = new Date(currentDate);
+        logger.info('Iniciando sincronização de pedidos de venda e detalhes', {
+            stepName,
+            periodo: `${formatDate(oneYearAgo)} até ${formatDate(currentDate)}`,
+            totalSubSteps: 2
+        });
 
-        // 🔹 Loop de sincronização diaria de pedidos de venda
-        console.log("🔍 [Etapa 3.1] Sincronizando pedidos de venda por dia...");
+        // Sub-etapa 3.1: Loop de sincronização diária de pedidos de venda
+        logger.info('Sub-etapa 3.1: Sincronizando pedidos de venda por dia', { stepName });
         
+        let iterationDate = new Date(currentDate);
+        let totalDaysProcessed = 0;
+
         while (iterationDate >= oneYearAgo) {
-            const data_dia = iterationDate.toISOString().split('T')[0]; // Formata a data como "YYYY-MM-DD"
-            
-            console.log(`[Loop Pedido Venda] 🗓️ Sincronizando pedidos para o dia: ${data_dia}`);
+            const data_dia = iterationDate.toISOString().split('T')[0];
             
             try {
-                // Usa o novo serviço de Edge Function com retry
+                logger.debug('Sincronizando pedidos do dia', {
+                    stepName,
+                    data_dia,
+                    dayNumber: totalDaysProcessed + 1
+                });
+                
                 const result = await callEdgeFunction(
                     `${process.env.SUPABASE_URL}/functions/v1/sync_pedido_venda`,
                     { data_dia },
                     empresa_id,
                     accessToken,
-                    refresh_token
+                    refresh_token,
+                    { context: 'default' }
                 );
                 
-                console.log(`[Loop Pedido Venda] ✅ Resposta da sincronização para o dia ${data_dia}:`, result);
+                totalDaysProcessed++;
+                
+                if (metrics) {
+                    const recordCount = result?.recordsProcessed || 0;
+                    metrics.recordsProcessed(recordCount);
+                }
+
+                logger.debug('Dia sincronizado com sucesso', {
+                    stepName,
+                    data_dia,
+                    dayNumber: totalDaysProcessed,
+                    recordsProcessed: result?.recordsProcessed || 0
+                });
+
             } catch (error) {
-                // Registra o erro mas continua para o próximo dia
-                console.error(`❌ [Loop Pedido Venda] Erro ao sincronizar o dia ${data_dia}:`, error.message);
+                if (metrics) {
+                    metrics.recordError(error, { stepName, data_dia });
+                }
+
+                logger.warn('Falha ao sincronizar dia específico', {
+                    stepName,
+                    data_dia,
+                    error: error.message
+                });
+                // Continua para o próximo dia mesmo em caso de erro
             }
+
+            iterationDate.setDate(iterationDate.getDate() - 1);
             
-            iterationDate.setDate(iterationDate.getDate() - 1); // Retrocede um dia
-            console.log(`[Loop Pedido Venda] ⏸️ Aguardando 5 segundos antes da próxima iteração...`);
-            await delay(5000); // ✅ Delay de 5 segundos após cada requisição
+            const dayDelayTime = getDelay('days');
+            await delay(dayDelayTime);
         }
+
+        logger.info('Sub-etapa 3.1 concluída', {
+            stepName,
+            totalDaysProcessed
+        });
+
+        // Delay entre sub-etapas
+        const miniDelayTime = getDelay('steps', 'mini');
+        await delay(miniDelayTime);
+
+        // Sub-etapa 3.2: Loop de sincronização de detalhes dos pedidos de venda
+        logger.info('Sub-etapa 3.2: Sincronizando detalhes dos pedidos de venda', { stepName });
         
-        // 🔹 Loop de sincronização semanal de detalhes dos pedidos de venda
-        console.log("🔍 [Etapa 3.2] Sincronizando detalhes dos pedidos de venda...");
-        
-        await syncWithPagination(
+        const detalhesResult = await syncWithPagination(
             `${process.env.SUPABASE_URL}/functions/v1/detalhes_pedido_venda`,
-            { empresa_id, access_token: accessToken },
+            { 
+                empresa_id: Number(empresa_id), 
+                access_token: accessToken 
+            },
             empresa_id, 
-            refresh_token
+            refresh_token,
+            false,
+            `${stepName}-detalhes`
         );
-        
-        console.log(`[Loop Detalhe Pedido Venda] ⏸️ Aguardando 5 segundos antes da próxima etapa...`);
-        await delay(5000);
-        
-        console.log("✅ [Etapa 3] Pedidos de Venda e Detalhes concluídos com sucesso.");
+
+        logger.info('Sub-etapa 3.2 concluída', {
+            stepName,
+            totalRecords: detalhesResult.totalRecordsProcessed
+        });
+
+        const finalStats = {
+            daysProcessed: totalDaysProcessed,
+            detalhes: detalhesResult,
+            totalRecords: detalhesResult.totalRecordsProcessed
+        };
+
+        if (metrics) {
+            metrics.endStep('completed');
+        }
+
+        logOperationEnd(`firstTime-${stepName}`, true, {
+            empresa_id,
+            ...finalStats
+        });
+
+        logger.info('Etapa de pedidos de venda concluída com sucesso', {
+            stepName,
+            ...finalStats
+        });
+
+        return finalStats;
+
     } catch (error) {
-        console.error("❌ [Etapa 3] Erro na sincronização de pedidos de venda:", error);
+        if (metrics) {
+            metrics.recordError(error, { stepName });
+            metrics.endStep('failed');
+        }
+
+        logOperationEnd(`firstTime-${stepName}`, false, {
+            empresa_id,
+            error: error.message
+        });
+
+        logError(error, `firstTime-${stepName}`, { empresa_id });
         throw error;
     }
 }
 
-// =========================
-// Etapa 4: Pedidos de Compra e Detalhes
-// =========================
+// ===========================
+// ETAPA 4: PEDIDOS DE COMPRA E DETALHES
+// ===========================
 
 async function etapaPedidosCompra(empresa_id, accessToken, refresh_token) {
-    console.log("🚀 [Etapa 4] Iniciando sincronização de Pedidos de Compra e Detalhes");
+    const stepName = 'pedidos-compra';
+    const logger = createSyncContext(empresa_id, 'first-time', stepName);
+    const metrics = getSyncMetrics(empresa_id, 'first-time');
+
+    logOperationStart(`firstTime-${stepName}`, { empresa_id });
+    
+    if (metrics) {
+        metrics.startStep(stepName);
+    }
 
     try {
+        logger.info('Iniciando sincronização de pedidos de compra e detalhes', {
+            stepName,
+            totalSubSteps: 3
+        });
+
+        // Busca fornecedores no Supabase
         const { data: fornecedoresList, error } = await supabase
             .from("fornecedores")
             .select("id_bling")
@@ -212,95 +546,197 @@ async function etapaPedidosCompra(empresa_id, accessToken, refresh_token) {
 
         if (error) throw error;
 
-        console.log(`🔎 [Fornecedores] Total de fornecedores encontrados: ${fornecedoresList.length}`);
+        logger.info('Fornecedores encontrados para sincronização', {
+            stepName,
+            totalFornecedores: fornecedoresList.length
+        });
 
-        // 🔹 Loop para sincronizar pedidos de compra por fornecedor
-        console.log("🔍 [Etapa 4.1] Sincronizando pedidos de compra por fornecedor...");
+        // Sub-etapa 4.1: Loop para sincronizar pedidos de compra por fornecedor
+        logger.info('Sub-etapa 4.1: Sincronizando pedidos de compra por fornecedor', { stepName });
         
+        let processedSuppliers = 0;
+        let skippedSuppliers = 0;
+
         for (const [index, forn] of fornecedoresList.entries()) {
             if (forn.id_bling === 0) {
-                console.warn(`⚠️ [Fornecedor ${index + 1}/${fornecedoresList.length}] Ignorado - ID inválido: ${forn.id_bling}`);
-                continue; // Pule este fornecedor
+                skippedSuppliers++;
+                logger.warn('Fornecedor ignorado - ID inválido', {
+                    stepName,
+                    supplierIndex: index + 1,
+                    totalSuppliers: fornecedoresList.length,
+                    id_bling: forn.id_bling
+                });
+                continue;
             }
 
-            console.log(`🔁 [Fornecedor ${index + 1}/${fornecedoresList.length}] Iniciando sincronização - ID: ${forn.id_bling}`);
-
             try {
-                // Usa o novo serviço de Edge Function com retry
                 await callEdgeFunction(
                     `${process.env.SUPABASE_URL}/functions/v1/sync_pedido_compra`,
                     { id_bling_fornecedor: forn.id_bling },
                     empresa_id,
                     accessToken,
-                    refresh_token
+                    refresh_token,
+                    { context: 'default' }
                 );
                 
-                console.log(`✅ [Fornecedor ${forn.id_bling}] Sincronização concluída.`);
+                processedSuppliers++;
+                
+                if (metrics) {
+                    metrics.recordsProcessed(1); // 1 fornecedor processado
+                }
+
+                logger.debug('Fornecedor sincronizado', {
+                    stepName,
+                    supplierIndex: index + 1,
+                    totalSuppliers: fornecedoresList.length,
+                    id_bling: forn.id_bling
+                });
+
             } catch (error) {
-                // Registra o erro mas continua para o próximo fornecedor
-                console.error(`❌ [Fornecedor ${forn.id_bling}] Erro durante a sincronização:`, error.message);
+                if (metrics) {
+                    metrics.recordError(error, {
+                        stepName,
+                        id_bling_fornecedor: forn.id_bling
+                    });
+                }
+
+                logger.warn('Erro ao sincronizar fornecedor', {
+                    stepName,
+                    id_bling: forn.id_bling,
+                    error: error.message
+                });
+                // Continua para o próximo fornecedor mesmo em caso de erro
             }
 
-            console.log(`⏸️ Aguardando 5 segundos antes do próximo fornecedor...`);
-            await delay(5000);
-            
-            console.log(`🔁 [Fornecedor ${index + 1}/${fornecedoresList.length}] Finalizado.`);
+            const supplierDelayTime = getDelay('suppliers');
+            await delay(supplierDelayTime);
         }
 
-        console.log("✅ [Fornecedores] Loop de sincronização concluído.");
+        logger.info('Sub-etapa 4.1 concluída', {
+            stepName,
+            processedSuppliers,
+            skippedSuppliers,
+            totalSuppliers: fornecedoresList.length
+        });
 
-        // 🔹 Sincronização de detalhes dos pedidos de compra
-        console.log("🔍 [Etapa 4.2] Sincronizando detalhes de pedidos de compra...");
+        // Delay entre sub-etapas
+        const miniDelayTime = getDelay('steps', 'mini');
+        await delay(miniDelayTime);
+
+        // Sub-etapa 4.2: Sincronização de detalhes dos pedidos de compra
+        logger.info('Sub-etapa 4.2: Sincronizando detalhes de pedidos de compra', { stepName });
         
-        await syncWithPagination(
+        const detalhesResult = await syncWithPagination(
             `${process.env.SUPABASE_URL}/functions/v1/detalhes_pedido_compra`,
-            { empresa_id, access_token: accessToken },
+            { 
+                empresa_id: Number(empresa_id), 
+                access_token: accessToken 
+            },
             empresa_id, 
-            refresh_token
+            refresh_token,
+            false,
+            `${stepName}-detalhes`
         );
-        
-        console.log("✅ [detalhes_pedido_compra] Sincronização concluída.");
-        console.log("⏸️ Aguardando 10 segundos antes da próxima etapa...");
-        await delay(10000);
 
-        // 🔹 Sincronização das últimas compras
-        console.log("🔍 [Etapa 4.3] Sincronizando últimas compras...");
+        logger.info('Sub-etapa 4.2 concluída', {
+            stepName,
+            totalRecords: detalhesResult.totalRecordsProcessed
+        });
+
+        await delay(miniDelayTime);
+
+        // Sub-etapa 4.3: Sincronização das últimas compras
+        logger.info('Sub-etapa 4.3: Sincronizando últimas compras', { stepName });
         
-        await syncWithPagination(
+        const ultimasComprasResult = await syncWithPagination(
             `${process.env.SUPABASE_URL}/functions/v1/sincronizar_ultimas_compras`,
-            { empresa_id, access_token: accessToken },
+            { 
+                empresa_id: Number(empresa_id), 
+                access_token: accessToken 
+            },
             empresa_id, 
-            refresh_token
+            refresh_token,
+            false,
+            `${stepName}-ultimas`
         );
-        
-        console.log("✅ [sincronizar_ultimas_compras] Sincronização concluída.");
-        console.log("⏸️ Aguardando 5 segundos antes da próxima etapa...");
-        await delay(5000);
 
-        console.log("✅ [Etapa 4] Pedidos de Compra e Detalhes concluídos com sucesso.");
+        logger.info('Sub-etapa 4.3 concluída', {
+            stepName,
+            totalRecords: ultimasComprasResult.totalRecordsProcessed
+        });
+
+        const finalStats = {
+            processedSuppliers,
+            skippedSuppliers,
+            detalhes: detalhesResult,
+            ultimasCompras: ultimasComprasResult,
+            totalRecords: detalhesResult.totalRecordsProcessed + ultimasComprasResult.totalRecordsProcessed
+        };
+
+        if (metrics) {
+            metrics.endStep('completed');
+        }
+
+        logOperationEnd(`firstTime-${stepName}`, true, {
+            empresa_id,
+            ...finalStats
+        });
+
+        logger.info('Etapa de pedidos de compra concluída com sucesso', {
+            stepName,
+            ...finalStats
+        });
+
+        return finalStats;
+
     } catch (error) {
-        console.error("❌ [Etapa 4] Erro na sincronização de pedidos de compra:", error);
+        if (metrics) {
+            metrics.recordError(error, { stepName });
+            metrics.endStep('failed');
+        }
+
+        logOperationEnd(`firstTime-${stepName}`, false, {
+            empresa_id,
+            error: error.message
+        });
+
+        logError(error, `firstTime-${stepName}`, { empresa_id });
         throw error;
     }
 }
 
-// =========================
-// Etapa 5: Fluxo de Notas Fiscais
-// =========================
+// ===========================
+// ETAPA 5: FLUXO DE NOTAS FISCAIS
+// ===========================
 
 async function etapaNotasFiscais(empresa_id, accessToken, refresh_token) {
-    console.log("🚀 [Etapa 5] Iniciando sincronização do Fluxo de Notas Fiscais");
+    const stepName = 'notas-fiscais';
+    const logger = createSyncContext(empresa_id, 'first-time', stepName);
+    const metrics = getSyncMetrics(empresa_id, 'first-time');
+
+    logOperationStart(`firstTime-${stepName}`, { empresa_id });
+    
+    if (metrics) {
+        metrics.startStep(stepName);
+    }
 
     try {
         const currentDate = new Date();
         const oneYearAgo = new Date(currentDate);
-        oneYearAgo.setFullYear(currentDate.getFullYear() - 1);
+        oneYearAgo.setFullYear(currentDate.getFullYear() - SYNC.FIRST_TIME_PERIOD_MONTHS / 12);
 
-        let iterationDate = new Date(currentDate);
+        logger.info('Iniciando sincronização do fluxo de notas fiscais', {
+            stepName,
+            periodo: `${formatDate(oneYearAgo)} até ${formatDate(currentDate)}`,
+            totalSubSteps: 7
+        });
 
-        // 🔹 Loop de sincronização mensal de últimas compras
-        console.log("🔍 [Etapa 5.1] Sincronizando últimas compras por mês...");
+        // Sub-etapa 5.1: Loop de sincronização mensal de últimas compras
+        logger.info('Sub-etapa 5.1: Sincronizando últimas compras por mês', { stepName });
         
+        let iterationDate = new Date(currentDate);
+        let totalMonthsProcessed = 0;
+
         while (iterationDate >= oneYearAgo) {
             const startDate = new Date(iterationDate);
             startDate.setDate(1); // Início do mês
@@ -308,45 +744,78 @@ async function etapaNotasFiscais(empresa_id, accessToken, refresh_token) {
             endDate.setDate(new Date(endDate.getFullYear(), endDate.getMonth() + 1, 0).getDate()); // Fim do mês
 
             try {
-                // Usa o novo serviço de Edge Function com retry
                 await callEdgeFunction(
                     `${process.env.SUPABASE_URL}/functions/v1/sincronizar_ultimas_compras`,
                     {
-                        start_date: dateUtils.formatDate(startDate),
-                        end_date: dateUtils.formatDate(endDate)
+                        start_date: formatDate(startDate),
+                        end_date: formatDate(endDate)
                     },
                     empresa_id,
                     accessToken,
-                    refresh_token
+                    refresh_token,
+                    { context: 'default' }
                 );
                 
-                console.log(`✅ [Últimas Compras] Mês ${dateUtils.formatDate(startDate)} sincronizado.`);
+                totalMonthsProcessed++;
+                
+                if (metrics) {
+                    metrics.recordsProcessed(1); // 1 mês processado
+                }
+
+                logger.debug('Mês sincronizado', {
+                    stepName,
+                    mes: formatDate(startDate),
+                    monthNumber: totalMonthsProcessed
+                });
+
             } catch (error) {
-                // Registra o erro mas continua para o próximo mês
-                console.error(`❌ [Últimas Compras] Erro ao sincronizar mês ${dateUtils.formatDate(startDate)}:`, error.message);
+                if (metrics) {
+                    metrics.recordError(error, { stepName, mes: formatDate(startDate) });
+                }
+
+                logger.warn('Erro ao sincronizar mês específico', {
+                    stepName,
+                    mes: formatDate(startDate),
+                    error: error.message
+                });
+                // Continua para o próximo mês mesmo em caso de erro
             }
 
-            await delay(20000); // Delay de 20 segundos após cada requisição
+            const monthDelayTime = getDelay('months');
+            await delay(monthDelayTime);
             iterationDate.setMonth(iterationDate.getMonth() - 1); // Retrocede um mês
         }
 
-        console.log("✅ [Loop Mensal Concluído] Sincronização de últimas compras finalizada.");
+        logger.info('Sub-etapa 5.1 concluída', {
+            stepName,
+            totalMonthsProcessed
+        });
 
-        // 🔹 Sincronização de detalhes das notas fiscais
-        console.log("🔍 [Etapa 5.2] Sincronizando detalhes das notas fiscais...");
+        // Sub-etapa 5.2: Sincronização de detalhes das notas fiscais
+        logger.info('Sub-etapa 5.2: Sincronizando detalhes das notas fiscais', { stepName });
         
-        await syncWithPagination(
+        const detalhesNotasResult = await syncWithPagination(
             `${process.env.SUPABASE_URL}/functions/v1/detalhes_nota_fiscal`,
-            { empresa_id, access_token: accessToken },
+            { 
+                empresa_id: Number(empresa_id), 
+                access_token: accessToken 
+            },
             empresa_id, 
-            refresh_token
+            refresh_token,
+            false,
+            `${stepName}-detalhes`
         );
-        
-        console.log(`✅ [Sucesso] Detalhes das notas fiscais sincronizados.`);
-        await delay(50000);
 
-        // 🔹 Loop de sincronização de notas fiscais por chave de acesso
-        console.log("🔍 [Etapa 5.3] Sincronizando notas fiscais por chave de acesso...");
+        logger.info('Sub-etapa 5.2 concluída', {
+            stepName,
+            totalRecords: detalhesNotasResult.totalRecordsProcessed
+        });
+
+        const afterDelayTime = getDelay('pagination');
+        await delay(afterDelayTime);
+
+        // Sub-etapa 5.3: Loop de sincronização de notas fiscais por chave de acesso
+        logger.info('Sub-etapa 5.3: Sincronizando notas fiscais por chave de acesso', { stepName });
         
         const { data: chavesList, error } = await supabase
             .from("notas_fiscais")
@@ -356,162 +825,405 @@ async function etapaNotasFiscais(empresa_id, accessToken, refresh_token) {
 
         if (error) throw error;
 
-        console.log(`📦 [Notas Fiscais] Total de chaves encontradas: ${chavesList.length}`);
+        logger.info('Chaves de acesso encontradas', {
+            stepName,
+            totalChaves: chavesList?.length || 0
+        });
 
-        for (const [index, nota] of chavesList.entries()) {
+        let processedNotes = 0;
+        let erroredNotes = 0;
+
+        for (const [index, nota] of (chavesList || []).entries()) {
             try {
-                // Usa o novo serviço de Edge Function com retry
                 await callEdgeFunction(
                     `${process.env.SUPABASE_URL}/functions/v1/detalhes_nota_fiscal_chave_acesso`,
-                    {
-                        chave_acesso: nota.chave_acesso
-                    },
+                    { chave_acesso: nota.chave_acesso },
                     empresa_id,
                     accessToken,
                     refresh_token,
-                    { maxRetries: 5 } // Menos tentativas para não travar muito tempo
+                    { 
+                        context: 'notes',
+                        maxRetries: 5 
+                    }
                 );
                 
-                console.log(`✅ [Nota ${index + 1}/${chavesList.length}] Chave ${nota.chave_acesso} sincronizada.`);
-            } catch (error) {
-                // Registra o erro mas continua para a próxima nota
-                console.error(`❌ [Nota ${index + 1}/${chavesList.length}] Erro ao sincronizar chave ${nota.chave_acesso}:`, error.message);
-            }
+                processedNotes++;
+                
+                if (metrics) {
+                    metrics.recordsProcessed(1);
+                }
 
-            if (index % 10 === 0 && index > 0) {
-                console.log(`⏸️ Pausa extra a cada 10 notas. Aguardando 5 segundos...`);
-                await delay(5000);
-            } else {
-                await delay(500);
+                if (index % 10 === 0 && index > 0) {
+                    logger.debug('Progresso de sincronização de notas', {
+                        stepName,
+                        processedNotes: index + 1,
+                        totalNotes: chavesList.length,
+                        progressPercent: Math.round(((index + 1) / chavesList.length) * 100)
+                    });
+                }
+                
+            } catch (error) {
+                erroredNotes++;
+                
+                if (metrics) {
+                    metrics.recordError(error, {
+                        stepName,
+                        chave_acesso: nota.chave_acesso.substring(0, 10)
+                    });
+                }
+
+                logger.warn('Erro ao sincronizar nota fiscal', {
+                    stepName,
+                    chave_preview: nota.chave_acesso.substring(0, 10),
+                    error: error.message
+                });
+            }
+            
+            await delay(500);
+            
+            // Pausa extra a cada lote de notas
+            if (index % SYNC.NOTES_BATCH_SIZE === (SYNC.NOTES_BATCH_SIZE - 1)) {
+                const batchDelayTime = getDelay('pagination', 'notes');
+                logger.debug('Pausa entre lotes de notas', {
+                    stepName,
+                    batchNumber: Math.floor(index / SYNC.NOTES_BATCH_SIZE) + 1,
+                    delayTime: `${batchDelayTime}ms`
+                });
+                await delay(batchDelayTime);
             }
         }
 
-        // 🔹 Detalhamento de Produtos
-        console.log("🔍 [Etapa 5.4] Detalhamento de produtos...");
+        logger.info('Sub-etapa 5.3 concluída', {
+            stepName,
+            processedNotes,
+            erroredNotes,
+            totalNotes: chavesList?.length || 0
+        });
+
+        // Sub-etapa 5.4: Detalhamento de Produtos via API Externa
+        logger.info('Sub-etapa 5.4: Detalhamento de produtos via EAN', { stepName });
         
         try {
-            // Usa o novo serviço de Edge Function com retry para outro endpoint
             await callEdgeFunction(
                 `${process.env.VALIDACAO_EAN_URL}/detalhamento_de_produtos/`,
                 {
                     webhook_url: process.env.WEBHOOK_URL,
-                    data_inicio: dateUtils.formatDate(oneYearAgo),
-                    data_fim: dateUtils.formatDate(currentDate)
+                    data_inicio: formatDate(oneYearAgo),
+                    data_fim: formatDate(currentDate)
                 },
                 empresa_id,
                 accessToken,
                 refresh_token,
                 { 
+                    context: 'external',
                     headers: { "Content-Type": "application/json" },
                     maxRetries: 3 
                 }
             );
             
-            console.log(`✅ [Sucesso] Detalhamento de produtos sincronizado.`);
+            logger.info('Sub-etapa 5.4 concluída com sucesso', { stepName });
+            
         } catch (error) {
-            console.error(`❌ [Erro] Falha no detalhamento de produtos:`, error.message);
+            if (metrics) {
+                metrics.recordError(error, { stepName, operation: 'detalhamento_produtos' });
+            }
+            logger.warn('Erro no detalhamento de produtos', {
+                stepName,
+                error: error.message
+            });
         }
 
-        // 🔹 Vínculo de Produtos por Fornecedor
-        console.log("🔍 [Etapa 5.5] Vínculo de produtos por fornecedor...");
+        // Sub-etapa 5.5: Vínculo de Produtos por Fornecedor
+        logger.info('Sub-etapa 5.5: Vínculo de produtos por fornecedor', { stepName });
         
         try {
-            // Usa o novo serviço de Edge Function com retry para outro endpoint
             await callEdgeFunction(
                 `${process.env.VALIDACAO_EAN_URL}/vinculo_produto_por_fornecedor/`,
-                {
-                    webhook_url: process.env.WEBHOOK_URL_VINCULO
-                },
+                { webhook_url: process.env.WEBHOOK_URL_VINCULO },
                 empresa_id,
                 accessToken,
                 refresh_token,
                 { 
+                    context: 'external',
                     headers: { "Content-Type": "application/json" },
                     maxRetries: 3 
                 }
             );
             
-            console.log(`✅ [Sucesso] Vínculo de produtos sincronizado.`);
+            logger.info('Sub-etapa 5.5 concluída com sucesso', { stepName });
+            
         } catch (error) {
-            console.error(`❌ [Erro] Falha no vínculo de produtos:`, error.message);
+            if (metrics) {
+                metrics.recordError(error, { stepName, operation: 'vinculo_produtos' });
+            }
+            logger.warn('Erro no vínculo de produtos', {
+                stepName,
+                error: error.message
+            });
         }
 
-        // 🔹 Sincronização de estoque
-        console.log("🔍 [Etapa 5.6] Sincronizando estoque...");
+        // Sub-etapa 5.6: Sincronização de estoque
+        logger.info('Sub-etapa 5.6: Sincronizando estoque', { stepName });
         
-        await syncWithPagination(
+        const estoqueResult = await syncWithPagination(
             `${process.env.SUPABASE_URL}/functions/v1/sync_estoque`,
-            { empresa_id, access_token: accessToken },
+            { 
+                empresa_id: Number(empresa_id), 
+                access_token: accessToken 
+            },
             empresa_id, 
-            refresh_token
+            refresh_token,
+            false,
+            `${stepName}-estoque`
         );
-        
-        console.log(`✅ [Sucesso] Sincronização de estoque concluída.`);
-        await delay(5000);
 
-        // 🔹 Sincronização de formas de pagamento dos pedidos de compra
-        console.log("🔍 [Etapa 5.7] Sincronizando formas de pagamento...");
+        logger.info('Sub-etapa 5.6 concluída', {
+            stepName,
+            totalRecords: estoqueResult.totalRecordsProcessed
+        });
+
+        const miniDelayTime = getDelay('steps', 'mini');
+        await delay(miniDelayTime);
+
+        // Sub-etapa 5.7: Sincronização de formas de pagamento dos pedidos de compra
+        logger.info('Sub-etapa 5.7: Sincronizando formas de pagamento', { stepName });
         
-        await syncWithPagination(
+        const formasPagamentoResult = await syncWithPagination(
             `${process.env.SUPABASE_URL}/functions/v1/sync_formas_de_pagamento_pedidos_de_compra`,
-            { empresa_id, access_token: accessToken },
+            { 
+                empresa_id: Number(empresa_id), 
+                access_token: accessToken 
+            },
             empresa_id, 
-            refresh_token
+            refresh_token,
+            false,
+            `${stepName}-pagamentos`
         );
-        
-        console.log(`✅ [Sucesso] Sincronização de formas de pagamento concluída.`);
-        await delay(5000);
 
-        console.log("✅ [Etapa 5] Fluxo de Notas Fiscais concluído com sucesso.");
+        logger.info('Sub-etapa 5.7 concluída', {
+            stepName,
+            totalRecords: formasPagamentoResult.totalRecordsProcessed
+        });
+
+        const finalStats = {
+            totalMonthsProcessed,
+            detalhesNotas: detalhesNotasResult,
+            processedNotes,
+            erroredNotes,
+            estoque: estoqueResult,
+            formasPagamento: formasPagamentoResult,
+            totalRecords: detalhesNotasResult.totalRecordsProcessed + 
+                          processedNotes + 
+                          estoqueResult.totalRecordsProcessed + 
+                          formasPagamentoResult.totalRecordsProcessed
+        };
+
+        if (metrics) {
+            metrics.endStep('completed');
+        }
+
+        logOperationEnd(`firstTime-${stepName}`, true, {
+            empresa_id,
+            ...finalStats
+        });
+
+        logger.info('Etapa de notas fiscais concluída com sucesso', {
+            stepName,
+            ...finalStats
+        });
+
+        return finalStats;
+
     } catch (error) {
-        console.error("❌ [Etapa 5] Erro na sincronização de notas fiscais:", error);
+        if (metrics) {
+            metrics.recordError(error, { stepName });
+            metrics.endStep('failed');
+        }
+
+        logOperationEnd(`firstTime-${stepName}`, false, {
+            empresa_id,
+            error: error.message
+        });
+
+        logError(error, `firstTime-${stepName}`, { empresa_id });
         throw error;
     }
 }
 
-// =========================
-// Função Principal
-// =========================
+// ===========================
+// FUNÇÃO PRINCIPAL
+// ===========================
 
 async function executeSteps(empresa_id, accessToken, refresh_token, paginaAtual = 1) {
+    const logger = createSyncContext(empresa_id, 'first-time', 'main-flow');
+    const metrics = getSyncMetrics(empresa_id, 'first-time');
+
+    logOperationStart('executeSteps', { empresa_id, paginaAtual });
+
     try {
-        console.log(`🚀 Iniciando sincronização em etapas para empresa ${empresa_id}, página inicial: ${paginaAtual}`);
+        logger.info('Iniciando sincronização completa em etapas', {
+            empresa_id,
+            paginaAtual,
+            totalSteps: 5
+        });
         
         // Obtém um token válido
         const token = await getValidBlingToken(Number(empresa_id), accessToken, refresh_token);
-        console.log(`🔑 Token válido obtido: ${token.substring(0, 10)}...`);
+        
+        logger.info('Token válido obtido para sincronização', {
+            tokenPreview: `${token.substring(0, 8)}***`
+        });
         
         // Executa as etapas sequencialmente
-        await etapaProdutos(empresa_id, token, refresh_token, paginaAtual);
-        console.log(`⏸️ Aguardando ${TIME_80s/1000} segundos antes da próxima etapa...`);
-        await delay(TIME_80s);
-        
-        await etapaFornecedores(empresa_id, token, refresh_token);
-        console.log(`⏸️ Aguardando ${TIME_80s/1000} segundos antes da próxima etapa...`);
-        await delay(TIME_80s);
-        
-        await etapaPedidosVenda(empresa_id, token, refresh_token);
-        console.log(`⏸️ Aguardando ${TIME_80s/1000} segundos antes da próxima etapa...`);
-        await delay(TIME_80s);
-        
-        await etapaPedidosCompra(empresa_id, token, refresh_token);
-        console.log(`⏸️ Aguardando ${TIME_80s/1000} segundos antes da próxima etapa...`);
-        await delay(TIME_80s);
-        
-        await etapaNotasFiscais(empresa_id, token, refresh_token);
+        const steps = [
+            { 
+                name: 'Produtos', 
+                fn: () => etapaProdutos(empresa_id, token, refresh_token, paginaAtual) 
+            },
+            { 
+                name: 'Fornecedores', 
+                fn: () => etapaFornecedores(empresa_id, token, refresh_token) 
+            },
+            { 
+                name: 'Pedidos de Venda', 
+                fn: () => etapaPedidosVenda(empresa_id, token, refresh_token) 
+            },
+            { 
+                name: 'Pedidos de Compra', 
+                fn: () => etapaPedidosCompra(empresa_id, token, refresh_token) 
+            },
+            { 
+                name: 'Notas Fiscais', 
+                fn: () => etapaNotasFiscais(empresa_id, token, refresh_token) 
+            }
+        ];
 
-        console.log("✅ Sincronização concluída com sucesso!");
-        return { success: true, message: "Sincronização completa concluída com sucesso" };
-    } catch (error) {
-        console.error("❌ Erro durante a sincronização:", error);
-        return { 
-            success: false, 
-            message: "Erro durante a sincronização", 
-            error: error.message || "Erro desconhecido" 
+        const stepResults = [];
+
+        for (let i = 0; i < steps.length; i++) {
+            const step = steps[i];
+            const stepNumber = i + 1;
+            
+            try {
+                logger.info(`Iniciando etapa ${stepNumber}/5: ${step.name}`, {
+                    stepName: step.name,
+                    stepNumber,
+                    totalSteps: steps.length
+                });
+
+                const stepResult = await step.fn();
+                stepResults.push({
+                    stepName: step.name,
+                    stepNumber,
+                    success: true,
+                    ...stepResult
+                });
+
+                logger.info(`Etapa ${stepNumber}/5 concluída: ${step.name}`, {
+                    stepName: step.name,
+                    stepNumber,
+                    totalRecords: stepResult.totalRecords
+                });
+
+                // Delay entre etapas (exceto na última)
+                if (i < steps.length - 1) {
+                    const stepDelayTime = getDelay('steps');
+                    logger.info(`Aguardando ${stepDelayTime/1000}s antes da próxima etapa...`, {
+                        currentStep: step.name,
+                        nextStep: steps[i + 1].name
+                    });
+                    await delay(stepDelayTime);
+                }
+
+            } catch (error) {
+                stepResults.push({
+                    stepName: step.name,
+                    stepNumber,
+                    success: false,
+                    error: error.message
+                });
+
+                logger.error(`Erro na etapa ${stepNumber}/5: ${step.name}`, {
+                    stepName: step.name,
+                    stepNumber,
+                    error: error.message
+                });
+                
+                // Para a execução em caso de erro
+                throw error;
+            }
+        }
+
+        const totalRecords = stepResults.reduce((sum, step) => sum + (step.totalRecords || 0), 0);
+
+        const finalResult = {
+            success: true,
+            message: "Sincronização completa concluída com sucesso",
+            empresa_id: Number(empresa_id),
+            paginaAtual,
+            totalSteps: steps.length,
+            totalRecords,
+            stepResults,
+            ...(metrics && {
+                metrics: metrics.getReport()
+            })
         };
+
+        logOperationEnd('executeSteps', true, {
+            empresa_id,
+            totalRecords,
+            totalSteps: steps.length
+        });
+
+        logger.info('Sincronização completa concluída com sucesso', {
+            totalSteps: steps.length,
+            totalRecords,
+            duration: metrics ? `${Date.now() - metrics.startTime}ms` : 'N/A'
+        });
+
+        return finalResult;
+
+    } catch (error) {
+        const errorResult = {
+            success: false,
+            message: "Erro durante a sincronização completa",
+            error: error.message || "Erro desconhecido",
+            empresa_id: Number(empresa_id),
+            paginaAtual,
+            ...(metrics && {
+                metrics: metrics.getReport()
+            })
+        };
+
+        logOperationEnd('executeSteps', false, {
+            empresa_id,
+            error: error.message
+        });
+
+        logError(error, 'executeSteps', {
+            empresa_id,
+            paginaAtual
+        });
+
+        return errorResult;
     }
 }
 
+// ===========================
+// EXPORTAÇÕES
+// ===========================
+
 module.exports = {
+    // Função principal (compatibilidade mantida)
     executeSteps,
+    
+    // Funções individuais das etapas (para uso no syncService)
+    etapaProdutos,
+    etapaFornecedores,
+    etapaPedidosVenda,
+    etapaPedidosCompra,
+    etapaNotasFiscais,
+    
+    // Função auxiliar
+    syncWithPagination
 };
