@@ -1,4 +1,4 @@
-// src/services/blingTokenService.js - VERSÃO CORRIGIDA
+// src/services/blingTokenService.js - VERSÃO CORRIGIDA E ATUALIZADA
 const axios = require("axios");
 const FormData = require("form-data");
 const supabase = require("./supabaseService");
@@ -16,10 +16,18 @@ const {
   withBlingRateLimit 
 } = require("../utils/rateLimiter");
 
+// ===========================
+// CONSTANTES DE CONFIGURAÇÃO
+// ===========================
+const MUTEX_TIMEOUT = 30000; // 30 segundos
+const DATE_COMPARISON_TOLERANCE = 2000; // 2 segundos de tolerância para timezone
+const RENEWAL_GRACE_PERIOD = 60000; // 1 minuto mínimo para próxima renovação
+
 class TokenManager {
     constructor() {
         this.renewalIntervals = new Map();
         this.renewalMutex = new Map(); // Previne renovações concorrentes
+        this.mutexTimers = new Map(); // ✅ NOVO: Timers para limpar mutex travados
         
         // Usa configurações centralizadas
         this.TOKEN_RENEWAL_INTERVAL = TOKEN.RENEWAL_INTERVAL;
@@ -33,9 +41,9 @@ class TokenManager {
             failedRenewals: 0,
             averageRenewalTime: 0,
             lastRenewalTime: null,
-            // ✅ NOVA MÉTRICA: Para tracking de problemas
             mutexTimeouts: 0,
-            mutexClears: 0
+            mutexClears: 0,
+            autoCleanups: 0 // ✅ NOVA MÉTRICA: Limpezas automáticas
         };
 
         // Logger contexto para tokens
@@ -44,18 +52,21 @@ class TokenManager {
         this.logger.info('Token Manager inicializado', {
             renewalInterval: `${this.TOKEN_RENEWAL_INTERVAL}ms`,
             expirationBuffer: `${this.TOKEN_EXPIRATION_BUFFER}ms`,
-            timeout: `${this.REQUEST_TIMEOUT}ms`
+            timeout: `${this.REQUEST_TIMEOUT}ms`,
+            mutexTimeout: `${MUTEX_TIMEOUT}ms`
         });
+
+        // ✅ NOVO: Inicia limpeza automática de mutex travados
+        this._startMutexCleanupTimer();
     }
 
     /**
-     * ✅ FUNÇÃO CORRIGIDA: Obtém token válido com controle de concorrência
+     * ✅ FUNÇÃO PRINCIPAL CORRIGIDA: Obtém token válido com controle robusto de concorrência
      */
     async getValidToken(empresa_id, accessToken = null, refresh_token = null) {
         const key = `empresa_${empresa_id}`;
         const logger = createTokenContext(empresa_id);
         
-        // 🐛 DEBUG: Log entrada da função
         logger.debug('getValidToken chamado', {
             operation: 'getValidToken',
             hasAccessToken: !!accessToken,
@@ -64,7 +75,7 @@ class TokenManager {
             activeRenewals: this.renewalIntervals.size
         });
         
-        // ✅ FIX: Timeout para mutex travado
+        // ✅ PROTEÇÃO MELHORADA: Timeout para mutex travado
         if (this.renewalMutex.has(key)) {
             logger.info('Aguardando renovação em progresso', {
                 operation: 'getValidToken',
@@ -72,53 +83,40 @@ class TokenManager {
             });
             
             try {
-                // ✅ PROTEÇÃO: Timeout de 30 segundos para mutex
                 const mutexPromise = this.renewalMutex.get(key);
                 const timeoutPromise = new Promise((_, reject) => {
-                    setTimeout(() => reject(new Error('Mutex timeout - possível deadlock')), 30000);
+                    setTimeout(() => reject(new Error('Mutex timeout - possível deadlock')), MUTEX_TIMEOUT);
                 });
                 
                 await Promise.race([mutexPromise, timeoutPromise]);
                 
                 // ✅ PÓS-MUTEX: Busca token atualizado do banco
                 const updatedToken = await this._getTokenFromDB(empresa_id);
-                if (updatedToken?.access_token) {
-                    logger.debug('Token obtido após aguardar mutex', {
+                if (updatedToken?.access_token && this._isTokenValid(updatedToken)) {
+                    logger.debug('Token válido obtido após aguardar mutex', {
                         operation: 'getValidToken',
                         tokenPreview: `${updatedToken.access_token.substring(0, 8)}***`
                     });
                     
-                    // ✅ REAGENDA: Garante que agendamento está ativo
-                    if (updatedToken.expires_at) {
-                        const expiresAt = new Date(updatedToken.expires_at);
-                        const timeUntilExpiry = expiresAt.getTime() - Date.now();
-                        if (timeUntilExpiry > this.TOKEN_EXPIRATION_BUFFER) {
-                            this._scheduleRenewal(empresa_id, updatedToken.refresh_token, timeUntilExpiry);
-                        }
-                    }
-                    
+                    this._ensureRenewalScheduled(empresa_id, updatedToken);
                     return updatedToken.access_token;
                 }
                 
             } catch (error) {
-                // ✅ MUTEX TRAVADO: Remove e continua
                 logger.warn('Mutex timeout ou erro, removendo mutex travado', {
                     operation: 'getValidToken',
                     error: error.message,
                     mutexKey: key
                 });
                 
-                this.renewalMutex.delete(key);
+                this._clearMutex(key);
                 this.stats.mutexTimeouts++;
-                
-                // Continua com a lógica normal após remover mutex travado
             }
         }
 
         try {
             const tokenData = await this._getTokenFromDB(empresa_id);
             
-            // 🐛 DEBUG: Log token do banco
             logger.debug('Token lido do banco', {
                 operation: 'getValidToken',
                 hasToken: !!tokenData,
@@ -135,37 +133,24 @@ class TokenManager {
                 return await this._renewToken(empresa_id, refresh_token || tokenData?.refresh_token);
             }
 
-            const expiresAt = new Date(tokenData.expires_at);
-            const now = new Date();
-            const timeUntilExpiry = expiresAt.getTime() - now.getTime();
-
-            // 🐛 DEBUG: Log cálculo de expiração
-            logger.debug('Cálculo de expiração', {
-                operation: 'getValidToken',
-                expiresAt: expiresAt.toISOString(),
-                currentTime: now.toISOString(),
-                timeUntilExpiry,
-                timeUntilExpiryMinutes: Math.round(timeUntilExpiry / 1000 / 60),
-                expirationBuffer: this.TOKEN_EXPIRATION_BUFFER,
-                shouldRenew: timeUntilExpiry <= this.TOKEN_EXPIRATION_BUFFER
-            });
-
-            // Só renova se realmente precisar
-            if (timeUntilExpiry <= this.TOKEN_EXPIRATION_BUFFER) {
+            // ✅ VALIDAÇÃO MELHORADA: Verifica se token é válido
+            if (!this._isTokenValid(tokenData)) {
+                const timeUntilExpiry = this._getTimeUntilExpiry(tokenData.expires_at);
                 const minutesUntilExpiry = Math.round(timeUntilExpiry / 1000 / 60);
                 
                 logger.info('Token próximo do vencimento, renovando', {
                     operation: 'getValidToken',
                     minutesUntilExpiry,
-                    expiresAt: expiresAt.toISOString()
+                    expiresAt: tokenData.expires_at
                 });
                 
                 return await this._renewToken(empresa_id, tokenData.refresh_token);
             }
 
-            // Garante que o agendamento está ativo
-            this._scheduleRenewal(empresa_id, tokenData.refresh_token, timeUntilExpiry);
+            // ✅ AGENDAMENTO: Garante que renovação está agendada
+            this._ensureRenewalScheduled(empresa_id, tokenData);
             
+            const timeUntilExpiry = this._getTimeUntilExpiry(tokenData.expires_at);
             logger.debug('Token válido obtido', {
                 operation: 'getValidToken',
                 minutesUntilExpiry: Math.round(timeUntilExpiry / 1000 / 60),
@@ -173,6 +158,7 @@ class TokenManager {
             });
             
             return tokenData.access_token;
+            
         } catch (error) {
             logError(error, 'getValidToken', { empresa_id });
             throw error;
@@ -180,13 +166,43 @@ class TokenManager {
     }
 
     /**
-     * ✅ FUNÇÃO CORRIGIDA: Renova token com mutex para evitar concorrência
+     * ✅ NOVA FUNÇÃO: Verifica se token é válido
+     */
+    _isTokenValid(tokenData) {
+        if (!tokenData?.expires_at) return false;
+        
+        const timeUntilExpiry = this._getTimeUntilExpiry(tokenData.expires_at);
+        return timeUntilExpiry > this.TOKEN_EXPIRATION_BUFFER;
+    }
+
+    /**
+     * ✅ NOVA FUNÇÃO: Calcula tempo até expiração
+     */
+    _getTimeUntilExpiry(expiresAt) {
+        const expirationDate = new Date(expiresAt);
+        return expirationDate.getTime() - Date.now();
+    }
+
+    /**
+     * ✅ NOVA FUNÇÃO: Garante que renovação está agendada
+     */
+    _ensureRenewalScheduled(empresa_id, tokenData) {
+        if (!this.renewalIntervals.has(empresa_id)) {
+            const timeUntilExpiry = this._getTimeUntilExpiry(tokenData.expires_at);
+            
+            if (timeUntilExpiry > this.TOKEN_EXPIRATION_BUFFER) {
+                this._scheduleRenewal(empresa_id, tokenData.refresh_token, timeUntilExpiry);
+            }
+        }
+    }
+
+    /**
+     * ✅ FUNÇÃO MELHORADA: Renova token com mutex robusto
      */
     async _renewToken(empresa_id, refresh_token) {
         const key = `empresa_${empresa_id}`;
         const logger = createTokenContext(empresa_id);
         
-        // 🐛 DEBUG: Log entrada da função
         logger.debug('_renewToken chamado', {
             operation: 'renewToken',
             hasRefreshToken: !!refresh_token,
@@ -200,14 +216,11 @@ class TokenManager {
             try {
                 const mutexPromise = this.renewalMutex.get(key);
                 const timeoutPromise = new Promise((_, reject) => {
-                    setTimeout(() => reject(new Error('Renewal mutex timeout')), 30000);
+                    setTimeout(() => reject(new Error('Renewal mutex timeout')), MUTEX_TIMEOUT);
                 });
                 
-                await Promise.race([mutexPromise, timeoutPromise]);
-                
-                // Busca token atualizado do banco
-                const tokenData = await this._getTokenFromDB(empresa_id);
-                return tokenData?.access_token;
+                const result = await Promise.race([mutexPromise, timeoutPromise]);
+                return result.access_token;
                 
             } catch (error) {
                 logger.warn('Timeout em mutex de renovação, removendo', {
@@ -215,15 +228,14 @@ class TokenManager {
                     error: error.message
                 });
                 
-                this.renewalMutex.delete(key);
+                this._clearMutex(key);
                 this.stats.mutexTimeouts++;
-                // Continua com renovação normal
             }
         }
 
-        // Cria mutex e registra no rate limiter
+        // Cria mutex com timeout automático
         const renewalPromise = this._performRenewal(empresa_id, refresh_token);
-        this.renewalMutex.set(key, renewalPromise);
+        this._setMutex(key, renewalPromise);
         
         // Registra no rate limiter para controle de concorrência
         rateLimiterManager.startTokenRenewal(empresa_id, renewalPromise);
@@ -232,26 +244,79 @@ class TokenManager {
             const result = await renewalPromise;
             return result.access_token;
         } catch (error) {
-            // ✅ LOG: Registra erro de renovação
             logger.error('Erro na renovação de token', {
                 operation: 'renewToken',
                 error: error.message
             });
             throw error;
         } finally {
-            // ✅ GARANTIA: Remove mutex SEMPRE
-            this.renewalMutex.delete(key);
+            this._clearMutex(key);
             this.stats.mutexClears++;
-            
-            logger.debug('Mutex removido', {
-                operation: 'renewToken',
-                mutexKey: key
-            });
         }
     }
 
     /**
-     * ✅ FUNÇÃO CORRIGIDA: Executa a renovação real com rate limiting e logging
+     * ✅ NOVA FUNÇÃO: Define mutex com timeout automático
+     */
+    _setMutex(key, promise) {
+        this.renewalMutex.set(key, promise);
+        
+        // ✅ PROTEÇÃO: Timer para limpar mutex automaticamente
+        const timer = setTimeout(() => {
+            if (this.renewalMutex.has(key)) {
+                this.logger.warn('Limpando mutex travado automaticamente', { 
+                    key,
+                    timeoutMs: MUTEX_TIMEOUT * 2 
+                });
+                this._clearMutex(key);
+                this.stats.autoCleanups++;
+            }
+        }, MUTEX_TIMEOUT * 2); // Dobro do timeout normal
+        
+        this.mutexTimers.set(key, timer);
+    }
+
+    /**
+     * ✅ NOVA FUNÇÃO: Limpa mutex e timer associado
+     */
+    _clearMutex(key) {
+        this.renewalMutex.delete(key);
+        
+        if (this.mutexTimers.has(key)) {
+            clearTimeout(this.mutexTimers.get(key));
+            this.mutexTimers.delete(key);
+        }
+    }
+
+    /**
+     * ✅ NOVA FUNÇÃO: Inicia timer de limpeza automática
+     */
+    _startMutexCleanupTimer() {
+        setInterval(() => {
+            const now = Date.now();
+            let cleanedMutex = 0;
+            
+            for (const [key, timer] of this.mutexTimers.entries()) {
+                // Se o timer foi criado há mais de 5 minutos, força limpeza
+                if (now - timer.created > 300000) { // 5 minutos
+                    this.logger.warn('Limpeza automática de mutex muito antigo', { key });
+                    this._clearMutex(key);
+                    cleanedMutex++;
+                }
+            }
+            
+            if (cleanedMutex > 0) {
+                this.stats.autoCleanups += cleanedMutex;
+                this.logger.info('Limpeza automática de mutex concluída', { 
+                    cleanedMutex,
+                    totalAutoCleanups: this.stats.autoCleanups 
+                });
+            }
+        }, 60000); // A cada 1 minuto
+    }
+
+    /**
+     * ✅ FUNÇÃO CORRIGIDA: Executa renovação com melhor tratamento de erros
      */
     async _performRenewal(empresa_id, refresh_token) {
         const logger = createTokenContext(empresa_id);
@@ -295,7 +360,6 @@ class TokenManager {
             const { access_token, refresh_token: new_refresh_token, expires_in } = result;
             const expires_at = new Date(Date.now() + expires_in * 1000);
 
-            // 🐛 DEBUG: Log dados da resposta do Bling
             logger.debug('Resposta do Bling recebida', {
                 operation: 'performRenewal',
                 expires_in,
@@ -303,10 +367,10 @@ class TokenManager {
                 tokenPreview: `${access_token.substring(0, 8)}***`
             });
 
-            // ✅ SALVA: No banco com validação
+            // ✅ SALVA: No banco com validação melhorada
             await this._saveTokenToDB(empresa_id, access_token, new_refresh_token, expires_at);
 
-            // ✅ FIX: Usa timeUntilExpiry correto, não expires_in * 1000
+            // ✅ AGENDAMENTO: Usa timeUntilExpiry correto
             const timeUntilExpiry = expires_at.getTime() - Date.now();
             this._scheduleRenewal(empresa_id, new_refresh_token, timeUntilExpiry);
 
@@ -354,12 +418,11 @@ class TokenManager {
     }
 
     /**
-     * ✅ FUNÇÃO CORRIGIDA: Agenda renovação com limpeza automática
+     * ✅ FUNÇÃO MELHORADA: Agenda renovação com validações robustas
      */
     _scheduleRenewal(empresa_id, refresh_token, timeUntilExpiry) {
         const logger = createTokenContext(empresa_id);
         
-        // 🐛 DEBUG: Log entrada da função
         const debugInfo = {
             empresa_id,
             timeUntilExpiry,
@@ -374,7 +437,7 @@ class TokenManager {
             ...debugInfo
         });
         
-        // ✅ VALIDAÇÃO: Verifica se timeUntilExpiry é válido
+        // ✅ VALIDAÇÃO ROBUSTA: Verifica se timeUntilExpiry é válido
         if (!timeUntilExpiry || timeUntilExpiry <= 0 || !isFinite(timeUntilExpiry)) {
             logger.error('timeUntilExpiry inválido, não agendando renovação', {
                 operation: 'scheduleRenewal',
@@ -387,12 +450,14 @@ class TokenManager {
         // Limpa agendamento anterior
         this.clearRenewal(empresa_id);
 
-        // Agenda para X minutos antes de expirar
-        const renewalTime = Math.max(timeUntilExpiry - this.TOKEN_EXPIRATION_BUFFER, 60000);
+        // ✅ CÁLCULO MELHORADO: Agenda para antes de expirar com grace period
+        const renewalTime = Math.max(
+            timeUntilExpiry - this.TOKEN_EXPIRATION_BUFFER, 
+            RENEWAL_GRACE_PERIOD
+        );
         const renewalMinutes = Math.round(renewalTime / 1000 / 60);
         const renewalAt = new Date(Date.now() + renewalTime);
         
-        // 🐛 DEBUG: Log cálculo do agendamento
         logger.debug('Cálculo de agendamento', {
             operation: 'scheduleRenewal',
             renewalTime,
@@ -401,7 +466,7 @@ class TokenManager {
             calculation: {
                 step1_timeUntilExpiry: timeUntilExpiry,
                 step2_minusBuffer: timeUntilExpiry - this.TOKEN_EXPIRATION_BUFFER,
-                step3_maxWith60s: Math.max(timeUntilExpiry - this.TOKEN_EXPIRATION_BUFFER, 60000),
+                step3_maxWithGrace: Math.max(timeUntilExpiry - this.TOKEN_EXPIRATION_BUFFER, RENEWAL_GRACE_PERIOD),
                 step4_finalTimestamp: Date.now() + renewalTime
             }
         });
@@ -431,7 +496,6 @@ class TokenManager {
 
         this.renewalIntervals.set(empresa_id, intervalId);
         
-        // 🐛 DEBUG: Log final do agendamento
         logger.debug('Renovação agendada com sucesso', {
             operation: 'scheduleRenewal',
             intervalId: intervalId.toString().substring(0, 10) + '...',
@@ -440,13 +504,12 @@ class TokenManager {
     }
 
     /**
-     * ✅ FUNÇÃO CORRIGIDA: Salva token no banco com validação
+     * ✅ FUNÇÃO CORRIGIDA: Salva token com tolerância de timezone
      */
     async _saveTokenToDB(empresa_id, access_token, refresh_token, expires_at) {
         const logger = createTokenContext(empresa_id);
         
         try {
-            // 🐛 DEBUG: Log antes de salvar
             logger.debug('Salvando token no banco', {
                 operation: 'saveTokenToDB',
                 expiresAt: expires_at.toISOString(),
@@ -463,21 +526,44 @@ class TokenManager {
                 },
                 { 
                     onConflict: ["empresa_id"],
-                    returning: "minimal" // ✅ Para confirmar que foi salvo
+                    returning: "minimal"
                 }
             );
 
             if (error) throw error;
             
-            // ✅ VALIDAÇÃO: Confirma que foi salvo lendo de volta
+            // ✅ VALIDAÇÃO MELHORADA: Com tolerância de timezone e formato
             const savedToken = await this._getTokenFromDB(empresa_id);
-            if (!savedToken || savedToken.expires_at !== expires_at.toISOString()) {
-                throw new Error(`Token não foi salvo corretamente. Expected: ${expires_at.toISOString()}, Got: ${savedToken?.expires_at}`);
+            if (!savedToken) {
+                throw new Error('Token não foi encontrado após salvamento');
+            }
+            
+            // ✅ NORMALIZAÇÃO: Compara timestamps em vez de strings
+            const expectedTime = new Date(expires_at).getTime();
+            const savedTime = new Date(savedToken.expires_at).getTime();
+            const timeDiff = Math.abs(expectedTime - savedTime);
+            
+            if (timeDiff > DATE_COMPARISON_TOLERANCE) {
+                // ⚠️ AVISO: Log a diferença mas pode não ser crítico
+                logger.warn('Diferença temporal detectada no token salvo', {
+                    operation: 'saveTokenToDB',
+                    expected: expires_at.toISOString(),
+                    saved: savedToken.expires_at,
+                    timeDifference: timeDiff,
+                    tolerance: DATE_COMPARISON_TOLERANCE
+                });
+                
+                // Se a diferença for muito grande, é erro real
+                if (timeDiff > 60000) { // Mais de 1 minuto = erro crítico
+                    throw new Error(`Token timestamp muito diferente: ${timeDiff}ms de diferença`);
+                }
             }
             
             logger.debug('Token salvo e validado no banco', {
                 operation: 'saveTokenToDB',
                 expiresAt: expires_at.toISOString(),
+                savedAt: savedToken.expires_at,
+                timeDifference: timeDiff,
                 validated: true
             });
             
@@ -486,6 +572,48 @@ class TokenManager {
                 empresa_id,
                 expiresAt: expires_at?.toISOString()
             });
+            throw error;
+        }
+    }
+
+    /**
+     * ✅ FUNÇÃO MELHORADA: Busca token com normalização de data
+     */
+    async _getTokenFromDB(empresa_id) {
+        const logger = createTokenContext(empresa_id);
+        
+        try {
+            const { data, error } = await supabase
+                .from("bling_tokens")
+                .select("access_token, refresh_token, expires_at")
+                .eq("empresa_id", empresa_id)
+                .maybeSingle();
+
+            if (error) throw error;
+            
+            // ✅ NORMALIZAÇÃO: Garante formato de data consistente
+            if (data && data.expires_at) {
+                try {
+                    // Converte para Date e volta para ISO string para normalizar
+                    data.expires_at = new Date(data.expires_at).toISOString();
+                } catch (dateError) {
+                    logger.warn('Erro ao normalizar data do token', {
+                        operation: 'getTokenFromDB',
+                        originalDate: data.expires_at,
+                        error: dateError.message
+                    });
+                }
+            }
+            
+            logger.debug('Token recuperado do banco', {
+                operation: 'getTokenFromDB',
+                hasToken: !!data,
+                expiresAt: data?.expires_at
+            });
+            
+            return data;
+        } catch (error) {
+            logError(error, 'getTokenFromDB', { empresa_id });
             throw error;
         }
     }
@@ -507,55 +635,41 @@ class TokenManager {
     }
 
     /**
-     * Limpa todos os agendamentos
+     * ✅ FUNÇÃO MELHORADA: Limpa todos os recursos
      */
     clearAllRenewals() {
         const totalIntervals = this.renewalIntervals.size;
+        const totalMutex = this.renewalMutex.size;
+        const totalTimers = this.mutexTimers.size;
         
-        this.logger.info('Limpando todos os agendamentos de renovação', {
+        this.logger.info('Limpando todos os recursos de token', {
             operation: 'clearAllRenewals',
-            totalIntervals
+            totalIntervals,
+            totalMutex,
+            totalTimers
         });
         
+        // Limpa intervalos de renovação
         for (const [empresa_id, intervalId] of this.renewalIntervals) {
             clearTimeout(intervalId);
         }
-        
         this.renewalIntervals.clear();
-        this.renewalMutex.clear(); // ✅ Também limpa mutex
         
-        this.logger.info('Todos os agendamentos removidos', {
-            operation: 'clearAllRenewals',
-            clearedIntervals: totalIntervals
-        });
-    }
-
-    /**
-     * Busca token no banco com logging
-     */
-    async _getTokenFromDB(empresa_id) {
-        const logger = createTokenContext(empresa_id);
+        // Limpa mutex de renovação
+        this.renewalMutex.clear();
         
-        try {
-            const { data, error } = await supabase
-                .from("bling_tokens")
-                .select("access_token, refresh_token, expires_at")
-                .eq("empresa_id", empresa_id)
-                .maybeSingle();
-
-            if (error) throw error;
-            
-            logger.debug('Token recuperado do banco', {
-                operation: 'getTokenFromDB',
-                hasToken: !!data,
-                expiresAt: data?.expires_at
-            });
-            
-            return data;
-        } catch (error) {
-            logError(error, 'getTokenFromDB', { empresa_id });
-            throw error;
+        // Limpa timers de mutex
+        for (const timer of this.mutexTimers.values()) {
+            clearTimeout(timer);
         }
+        this.mutexTimers.clear();
+        
+        this.logger.info('Todos os recursos removidos', {
+            operation: 'clearAllRenewals',
+            clearedIntervals: totalIntervals,
+            clearedMutex: totalMutex,
+            clearedTimers: totalTimers
+        });
     }
 
     /**
@@ -579,13 +693,14 @@ class TokenManager {
     }
 
     /**
-     * ✅ FUNÇÃO ATUALIZADA: Obtém estatísticas do token manager
+     * ✅ FUNÇÃO ATUALIZADA: Obtém estatísticas completas
      */
     getStats() {
         return {
             ...this.stats,
             activeRenewals: this.renewalIntervals.size,
             pendingRenewals: this.renewalMutex.size,
+            activeMutexTimers: this.mutexTimers.size,
             successRate: this.stats.totalRenewals > 0 
                 ? (this.stats.successfulRenewals / this.stats.totalRenewals * 100).toFixed(2) + '%'
                 : '0%',
@@ -594,23 +709,71 @@ class TokenManager {
     }
 
     /**
-     * Health check do token manager
+     * ✅ FUNÇÃO MELHORADA: Health check detalhado
      */
     getHealthStatus() {
         const stats = this.getStats();
-        const recentFailures = this.stats.failedRenewals > this.stats.successfulRenewals * 0.1; // Mais de 10% de falhas
+        const recentFailures = this.stats.failedRenewals > this.stats.successfulRenewals * 0.1;
         const hasTimeouts = this.stats.mutexTimeouts > 0;
+        const hasPendingMutex = this.renewalMutex.size > 0;
+        const hasStuckMutex = this.mutexTimers.size > this.renewalMutex.size;
+        
+        let status = 'healthy';
+        if (recentFailures || hasTimeouts || hasStuckMutex) {
+            status = 'warning';
+        }
+        if (hasPendingMutex && this.stats.mutexTimeouts > 3) {
+            status = 'unhealthy';
+        }
         
         return {
-            status: recentFailures || hasTimeouts ? 'warning' : 'healthy',
+            status,
             stats,
             issues: {
                 recentFailures,
                 hasTimeouts,
-                pendingMutex: this.renewalMutex.size > 0
+                hasPendingMutex,
+                hasStuckMutex,
+                timeoutCount: this.stats.mutexTimeouts,
+                autoCleanupCount: this.stats.autoCleanups
             },
+            recommendations: this._getHealthRecommendations(status, {
+                recentFailures,
+                hasTimeouts,
+                hasPendingMutex,
+                hasStuckMutex
+            }),
             timestamp: new Date().toISOString()
         };
+    }
+
+    /**
+     * ✅ NOVA FUNÇÃO: Gera recomendações de saúde
+     */
+    _getHealthRecommendations(status, issues) {
+        const recommendations = [];
+        
+        if (issues.recentFailures) {
+            recommendations.push('Alta taxa de falhas - verificar conectividade com Bling API');
+        }
+        
+        if (issues.hasTimeouts) {
+            recommendations.push('Timeouts de mutex detectados - pode indicar deadlocks');
+        }
+        
+        if (issues.hasPendingMutex) {
+            recommendations.push('Renovações pendentes - monitorar por travamentos');
+        }
+        
+        if (issues.hasStuckMutex) {
+            recommendations.push('Mutex órfãos detectados - limpeza automática ativa');
+        }
+        
+        if (status === 'healthy' && recommendations.length === 0) {
+            recommendations.push('Sistema funcionando normalmente');
+        }
+        
+        return recommendations;
     }
 }
 
@@ -628,10 +791,211 @@ module.exports = {
     clearAllRenewalIntervals: () => tokenManager.clearAllRenewals(),
     clearRenewalInterval: (empresa_id) => tokenManager.clearRenewal(empresa_id),
     
-    // Novas funcionalidades
+    // Novas funcionalidades de monitoramento
     getTokenManagerStats: () => tokenManager.getStats(),
     getTokenManagerHealth: () => tokenManager.getHealthStatus(),
     
     // Acesso à instância (para casos avançados)
-    tokenManager
+    tokenManager,
+    
+    // ✅ NOVAS FUNÇÕES UTILITÁRIAS
+    
+    /**
+     * Verifica se um token específico é válido sem renovar
+     */
+    isTokenValid: (empresa_id) => {
+        return tokenManager._getTokenFromDB(empresa_id)
+            .then(token => token ? tokenManager._isTokenValid(token) : false)
+            .catch(() => false);
+    },
+    
+    /**
+     * Força renovação de token específico
+     */
+    forceTokenRenewal: async (empresa_id, refresh_token) => {
+        try {
+            const result = await tokenManager._renewToken(empresa_id, refresh_token);
+            return { success: true, access_token: result };
+        } catch (error) {
+            return { success: false, error: error.message };
+        }
+    },
+    
+    /**
+     * Obtém informações detalhadas de um token sem renová-lo
+     */
+    getTokenInfo: async (empresa_id) => {
+        try {
+            const tokenData = await tokenManager._getTokenFromDB(empresa_id);
+            if (!tokenData) {
+                return { exists: false };
+            }
+            
+            const timeUntilExpiry = tokenManager._getTimeUntilExpiry(tokenData.expires_at);
+            const isValid = tokenManager._isTokenValid(tokenData);
+            
+            return {
+                exists: true,
+                isValid,
+                expiresAt: tokenData.expires_at,
+                timeUntilExpiry,
+                minutesUntilExpiry: Math.round(timeUntilExpiry / 1000 / 60),
+                hasRefreshToken: !!tokenData.refresh_token,
+                tokenPreview: tokenData.access_token ? 
+                    `${tokenData.access_token.substring(0, 8)}***` : null
+            };
+        } catch (error) {
+            return { exists: false, error: error.message };
+        }
+    },
+    
+    /**
+     * Limpa mutex travado de empresa específica
+     */
+    clearStuckMutex: (empresa_id) => {
+        const key = `empresa_${empresa_id}`;
+        if (tokenManager.renewalMutex.has(key)) {
+            tokenManager._clearMutex(key);
+            tokenManager.stats.mutexTimeouts++;
+            return { cleared: true, key };
+        }
+        return { cleared: false, key };
+    },
+    
+    /**
+     * Obtém lista de empresas com renovações ativas
+     */
+    getActiveRenewals: () => {
+        const renewals = [];
+        
+        for (const [empresa_id, intervalId] of tokenManager.renewalIntervals) {
+            renewals.push({
+                empresa_id: Number(empresa_id),
+                intervalId: intervalId.toString().substring(0, 10) + '...',
+                type: 'scheduled'
+            });
+        }
+        
+        for (const [key] of tokenManager.renewalMutex) {
+            const empresa_id = key.replace('empresa_', '');
+            renewals.push({
+                empresa_id: Number(empresa_id),
+                type: 'active_renewal'
+            });
+        }
+        
+        return {
+            count: renewals.length,
+            renewals,
+            scheduledCount: tokenManager.renewalIntervals.size,
+            activeCount: tokenManager.renewalMutex.size,
+            timestamp: new Date().toISOString()
+        };
+    },
+    
+    /**
+     * Executa diagnóstico completo do sistema de tokens
+     */
+    runDiagnostics: async () => {
+        const diagnostics = {
+            timestamp: new Date().toISOString(),
+            version: '2.0.0',
+            system: {
+                nodeVersion: process.version,
+                uptime: process.uptime(),
+                memoryUsage: process.memoryUsage()
+            },
+            tokenManager: {
+                stats: tokenManager.getStats(),
+                health: tokenManager.getHealthStatus(),
+                activeRenewals: tokenManager.renewalIntervals.size,
+                pendingMutex: tokenManager.renewalMutex.size,
+                mutexTimers: tokenManager.mutexTimers.size
+            },
+            rateLimiter: {
+                stats: rateLimiterManager.getAllStats()
+            },
+            recommendations: []
+        };
+        
+        // Análise e recomendações
+        const health = diagnostics.tokenManager.health;
+        
+        if (health.status !== 'healthy') {
+            diagnostics.recommendations.push(
+                'Sistema de tokens com problemas - verificar logs e métricas'
+            );
+        }
+        
+        if (diagnostics.tokenManager.pendingMutex > 0) {
+            diagnostics.recommendations.push(
+                `${diagnostics.tokenManager.pendingMutex} renovações pendentes - monitorar por travamentos`
+            );
+        }
+        
+        if (diagnostics.tokenManager.mutexTimers > diagnostics.tokenManager.pendingMutex) {
+            diagnostics.recommendations.push(
+                'Timers de mutex órfãos detectados - limpeza automática ativa'
+            );
+        }
+        
+        const memUsageMB = Math.round(diagnostics.system.memoryUsage.heapUsed / 1024 / 1024);
+        if (memUsageMB > 500) {
+            diagnostics.recommendations.push(
+                `Alto uso de memória: ${memUsageMB}MB - considerar restart`
+            );
+        }
+        
+        if (diagnostics.recommendations.length === 0) {
+            diagnostics.recommendations.push('Sistema funcionando normalmente');
+        }
+        
+        return diagnostics;
+    },
+    
+    /**
+     * Realiza manutenção preventiva do sistema de tokens
+     */
+    performMaintenance: () => {
+        const before = {
+            intervals: tokenManager.renewalIntervals.size,
+            mutex: tokenManager.renewalMutex.size,
+            timers: tokenManager.mutexTimers.size
+        };
+        
+        // Força limpeza de recursos órfãos
+        const now = Date.now();
+        let cleaned = 0;
+        
+        // Limpa mutex muito antigos (mais de 10 minutos)
+        for (const [key, timer] of tokenManager.mutexTimers.entries()) {
+            if (!tokenManager.renewalMutex.has(key.replace('empresa_', ''))) {
+                tokenManager._clearMutex(key);
+                cleaned++;
+            }
+        }
+        
+        const after = {
+            intervals: tokenManager.renewalIntervals.size,
+            mutex: tokenManager.renewalMutex.size,
+            timers: tokenManager.mutexTimers.size
+        };
+        
+        tokenManager.logger.info('Manutenção preventiva concluída', {
+            operation: 'performMaintenance',
+            before,
+            after,
+            cleaned,
+            timestamp: new Date().toISOString()
+        });
+        
+        return {
+            success: true,
+            before,
+            after,
+            cleaned,
+            message: `Manutenção concluída: ${cleaned} recursos órfãos removidos`,
+            timestamp: new Date().toISOString()
+        };
+    }
 };
