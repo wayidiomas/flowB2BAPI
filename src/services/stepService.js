@@ -1,4 +1,4 @@
-// src/services/stepService.js
+// src/services/stepService.js - VERSÃO MELHORADA E CONSISTENTE
 require("dotenv").config();
 const supabase = require("./supabaseService");
 const { formatDate } = require('../utils/dateUtils');
@@ -21,6 +21,7 @@ const {
 
 /**
  * Função unificada de paginação com logging e métricas integradas
+ * Versão melhorada para sincronização first-time
  */
 async function syncWithPagination(url, body, empresa_id, refresh_token, useQuantity = false, stepName = 'unknown') {
     let nextPage = 1;
@@ -31,7 +32,7 @@ async function syncWithPagination(url, body, empresa_id, refresh_token, useQuant
     const logger = createSyncContext(empresa_id, 'first-time', stepName);
     const metrics = getSyncMetrics(empresa_id, 'first-time');
 
-    logger.info('Iniciando paginação', {
+    logger.info('Iniciando paginação para sincronização first-time', {
         stepName,
         url: url.split('/').pop(),
         useQuantity,
@@ -142,7 +143,7 @@ async function syncWithPagination(url, body, empresa_id, refresh_token, useQuant
         }
     }
 
-    logger.info('Paginação concluída', {
+    logger.info('Paginação concluída com sucesso', {
         stepName,
         totalRecords: totalRecordsProcessed,
         totalPages: nextPage
@@ -1099,6 +1100,7 @@ async function executeSteps(empresa_id, accessToken, refresh_token, paginaAtual 
         ];
 
         const stepResults = [];
+        let totalProcessedRecords = 0;
 
         for (let i = 0; i < steps.length; i++) {
             const step = steps[i];
@@ -1118,6 +1120,9 @@ async function executeSteps(empresa_id, accessToken, refresh_token, paginaAtual 
                     success: true,
                     ...stepResult
                 });
+
+                // Acumula total de registros processados
+                totalProcessedRecords += stepResult?.totalRecords || 0;
 
                 logger.info(`Etapa ${stepNumber}/5 concluída: ${step.name}`, {
                     stepName: step.name,
@@ -1154,15 +1159,13 @@ async function executeSteps(empresa_id, accessToken, refresh_token, paginaAtual 
             }
         }
 
-        const totalRecords = stepResults.reduce((sum, step) => sum + (step.totalRecords || 0), 0);
-
         const finalResult = {
             success: true,
             message: "Sincronização completa concluída com sucesso",
             empresa_id: Number(empresa_id),
             paginaAtual,
             totalSteps: steps.length,
-            totalRecords,
+            totalRecords: totalProcessedRecords,
             stepResults,
             ...(metrics && {
                 metrics: metrics.getReport()
@@ -1171,13 +1174,13 @@ async function executeSteps(empresa_id, accessToken, refresh_token, paginaAtual 
 
         logOperationEnd('executeSteps', true, {
             empresa_id,
-            totalRecords,
+            totalRecords: totalProcessedRecords,
             totalSteps: steps.length
         });
 
         logger.info('Sincronização completa concluída com sucesso', {
             totalSteps: steps.length,
-            totalRecords,
+            totalRecords: totalProcessedRecords,
             duration: metrics ? `${Date.now() - metrics.startTime}ms` : 'N/A'
         });
 
@@ -1210,12 +1213,150 @@ async function executeSteps(empresa_id, accessToken, refresh_token, paginaAtual 
 }
 
 // ===========================
+// FUNÇÃO AUXILIAR PARA EXECUÇÃO POR ETAPA ESPECÍFICA
+// ===========================
+
+/**
+ * Executa steps a partir de uma etapa específica
+ * ✅ NOVA FUNÇÃO: Para suporte ao syncService melhorado
+ */
+async function executeStepsFromSpecificStep(empresa_id, accessToken, refresh_token, paginaAtual, startFromStep) {
+    const logger = createSyncContext(empresa_id, 'first-time', `from-${startFromStep}`);
+    const metrics = getSyncMetrics(empresa_id, 'first-time');
+    
+    try {
+        logger.info(`Iniciando sincronização first-time a partir da etapa: ${startFromStep}`, {
+            empresa_id,
+            startFromStep,
+            paginaAtual
+        });
+
+        // Mapeamento de etapas para funções
+        const stepFunctions = {
+            'produtos': () => etapaProdutos(empresa_id, accessToken, refresh_token, paginaAtual),
+            'fornecedores': () => etapaFornecedores(empresa_id, accessToken, refresh_token),
+            'pedidos-venda': () => etapaPedidosVenda(empresa_id, accessToken, refresh_token),
+            'pedidos-compra': () => etapaPedidosCompra(empresa_id, accessToken, refresh_token),
+            'notas-fiscais': () => etapaNotasFiscais(empresa_id, accessToken, refresh_token)
+        };
+
+        // Lista ordenada de etapas
+        const allSteps = ['produtos', 'fornecedores', 'pedidos-venda', 'pedidos-compra', 'notas-fiscais'];
+        const startIndex = allSteps.indexOf(startFromStep);
+        
+        if (startIndex === -1) {
+            throw new Error(`Etapa '${startFromStep}' não encontrada`);
+        }
+
+        // Executa apenas as etapas a partir da solicitada
+        const stepsToExecute = allSteps.slice(startIndex);
+        const stepResults = [];
+        let totalProcessedRecords = 0;
+        
+        logger.info(`Executando ${stepsToExecute.length} etapas`, {
+            stepsToExecute,
+            skippedSteps: allSteps.slice(0, startIndex)
+        });
+
+        for (let i = 0; i < stepsToExecute.length; i++) {
+            const stepName = stepsToExecute[i];
+            const stepNumber = startIndex + i + 1;
+            
+            logger.info(`Iniciando etapa ${stepNumber}/5: ${stepName}`, {
+                stepName,
+                stepNumber,
+                totalSteps: 5
+            });
+
+            try {
+                // Executa a etapa
+                const stepResult = await stepFunctions[stepName]();
+                stepResults.push({
+                    stepName,
+                    stepNumber,
+                    success: true,
+                    ...stepResult
+                });
+
+                totalProcessedRecords += stepResult?.totalRecords || 0;
+                
+                logger.info(`Etapa ${stepNumber}/5 concluída: ${stepName}`, {
+                    stepName,
+                    stepNumber,
+                    totalRecords: stepResult?.totalRecords || 0
+                });
+
+                // Delay entre etapas (exceto na última)
+                if (i < stepsToExecute.length - 1) {
+                    const delayTime = getDelay('steps');
+                    logger.info(`Aguardando ${delayTime/1000}s antes da próxima etapa...`);
+                    await delay(delayTime);
+                }
+
+            } catch (error) {
+                stepResults.push({
+                    stepName,
+                    stepNumber,
+                    success: false,
+                    error: error.message
+                });
+
+                logger.error(`Erro na etapa ${stepNumber}/5: ${stepName}`, {
+                    stepName,
+                    stepNumber,
+                    error: error.message
+                });
+                throw error;
+            }
+        }
+
+        logger.info('Sincronização first-time concluída com sucesso', {
+            totalStepsExecuted: stepsToExecute.length,
+            stepsExecuted: stepsToExecute,
+            totalRecords: totalProcessedRecords
+        });
+
+        return { 
+            success: true, 
+            message: `Sincronização first-time concluída a partir da etapa '${startFromStep}'`,
+            startFromStep,
+            stepsExecuted: stepsToExecute,
+            totalStepsExecuted: stepsToExecute.length,
+            totalRecords: totalProcessedRecords,
+            stepResults,
+            ...(metrics && {
+                metrics: metrics.getReport()
+            })
+        };
+
+    } catch (error) {
+        logger.error('Erro durante a sincronização first-time', {
+            error: error.message,
+            startFromStep
+        });
+        
+        return { 
+            success: false, 
+            message: `Erro durante a sincronização first-time a partir da etapa '${startFromStep}'`, 
+            error: error.message || "Erro desconhecido",
+            startFromStep,
+            ...(metrics && {
+                metrics: metrics.getReport()
+            })
+        };
+    }
+}
+
+// ===========================
 // EXPORTAÇÕES
 // ===========================
 
 module.exports = {
     // Função principal (compatibilidade mantida)
     executeSteps,
+    
+    // ✅ NOVA FUNÇÃO: Para execução a partir de etapa específica
+    executeStepsFromSpecificStep,
     
     // Funções individuais das etapas (para uso no syncService)
     etapaProdutos,

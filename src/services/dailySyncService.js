@@ -1,4 +1,4 @@
-// src/services/dailySyncService.js
+// src/services/dailySyncService.js - VERSÃO COMPLETAMENTE CORRIGIDA
 require("dotenv").config();
 const { formatDate } = require("../utils/dateUtils");
 const { getDelay, getRetryConfig, SYNC } = require("../config/SyncConfig");
@@ -27,6 +27,13 @@ async function syncWithPagination(url, body, empresa_id, refresh_token, useQuant
     
     const logger = createSyncContext(empresa_id, 'daily', stepName);
     const metrics = getSyncMetrics(empresa_id, 'daily');
+
+    logger.info('Iniciando paginação para sincronização diária', {
+        stepName,
+        url: url.split('/').pop(),
+        useQuantity,
+        startPage: nextPage
+    });
 
     while (!isPaginationFinished) {
         try {
@@ -132,6 +139,12 @@ async function syncWithPagination(url, body, empresa_id, refresh_token, useQuant
         }
     }
 
+    logger.info('Paginação concluída', {
+        stepName,
+        totalRecords: totalRecordsProcessed,
+        totalPages: nextPage
+    });
+
     return { totalRecordsProcessed, totalPages: nextPage };
 }
 
@@ -142,6 +155,12 @@ async function syncRecentData(url, body, limit = 100, stepName = 'unknown') {
     
     const logger = createSyncContext(body.empresa_id, 'daily', stepName);
     const metrics = getSyncMetrics(body.empresa_id, 'daily');
+
+    logger.info('Iniciando sincronização de dados recentes', {
+        stepName,
+        limit,
+        url: url.split('/').pop()
+    });
 
     while (true) {
         try {
@@ -228,6 +247,12 @@ async function syncRecentData(url, body, limit = 100, stepName = 'unknown') {
         }
     }
 
+    logger.info('Sincronização de dados recentes concluída', {
+        stepName,
+        totalRecords: totalRecordsProcessed,
+        totalPages: page
+    });
+
     return { allItems, totalRecordsProcessed, totalPages: page };
 }
 
@@ -296,6 +321,11 @@ async function step1_syncUltimosProdutos(empresa_id, access_token, refresh_token
             totalPages: result.totalPages
         });
 
+        return {
+            totalRecords: result.totalRecordsProcessed,
+            totalPages: result.totalPages
+        };
+
     } catch (error) {
         if (metrics) {
             metrics.recordError(error, { stepName });
@@ -311,165 +341,6 @@ async function step1_syncUltimosProdutos(empresa_id, access_token, refresh_token
         throw error;
     }
 }
-
-// =========================
-// Fluxo Principal
-// =========================
-
-async function executeDailySync(empresa_id, access_token, refresh_token) {
-    const logger = createSyncContext(empresa_id, 'daily', 'main-flow');
-    const metrics = getSyncMetrics(empresa_id, 'daily');
-
-    logOperationStart('executeDailySync', { empresa_id });
-
-    try {
-        // Obtém um token válido
-        access_token = await getValidBlingToken(Number(empresa_id), access_token, refresh_token);
-        
-        logger.info('Token válido obtido para sincronização diária', {
-            tokenPreview: `${access_token.substring(0, 8)}***`
-        });
-
-        const today = new Date();
-        const periodStart = new Date(today);
-        periodStart.setDate(today.getDate() - SYNC.DAILY_PERIOD_DAYS);
-
-        const data_inicial = formatDate(periodStart);
-        const data_final = formatDate(today);
-        
-        logger.info('Iniciando sincronização diária', {
-            empresa_id,
-            periodo: `${data_inicial} até ${data_final}`,
-            totalSteps: 6
-        });
-
-        // Executa as etapas sequencialmente
-        const steps = [
-            { name: 'Produtos', fn: () => step1_syncUltimosProdutos(empresa_id, access_token, refresh_token) },
-            { name: 'Fornecedores', fn: () => step2_syncFornecedores(empresa_id, access_token, refresh_token) },
-            { name: 'Vendas Atuais', fn: () => step3_syncVendasAtuais(empresa_id, access_token, refresh_token) },
-            { name: 'Detalhes Vendas', fn: () => step4_syncDetalhesVendas(empresa_id, access_token, refresh_token) },
-            { name: 'Pedidos Compra', fn: () => step5_syncPedidosCompra(empresa_id, access_token, refresh_token) },
-            { name: 'Notas Fiscais', fn: () => step6_syncNotasFiscais(empresa_id, access_token, refresh_token) }
-        ];
-
-        for (let i = 0; i < steps.length; i++) {
-            const step = steps[i];
-            const stepNumber = i + 1;
-            
-            try {
-                logger.info(`Iniciando etapa ${stepNumber}/6: ${step.name}`, {
-                    stepName: step.name,
-                    stepNumber,
-                    totalSteps: steps.length
-                });
-
-                await step.fn();
-
-                logger.info(`Etapa ${stepNumber}/6 concluída: ${step.name}`, {
-                    stepName: step.name,
-                    stepNumber
-                });
-
-                // Delay entre etapas (exceto na última)
-                if (i < steps.length - 1) {
-                    const stepDelayTime = getDelay('steps', 'mini');
-                    logger.debug('Aplicando delay entre etapas', {
-                        currentStep: step.name,
-                        nextStep: steps[i + 1].name,
-                        delayTime: `${stepDelayTime}ms`
-                    });
-                    await delay(stepDelayTime);
-                }
-
-            } catch (error) {
-                logger.error(`Erro na etapa ${stepNumber}/6: ${step.name}`, {
-                    stepName: step.name,
-                    stepNumber,
-                    error: error.message
-                });
-                
-                // Decide se deve continuar ou parar baseado na criticidade
-                if (stepNumber <= 3) { // Etapas críticas (1-3)
-                    logger.error('Erro em etapa crítica, interrompendo sincronização', {
-                        stepName: step.name,
-                        stepNumber
-                    });
-                    throw error;
-                } else { // Etapas não críticas (4-6)
-                    logger.warn('Erro em etapa não crítica, continuando sincronização', {
-                        stepName: step.name,
-                        stepNumber
-                    });
-                    // Registra erro nas métricas mas continua
-                    if (metrics) {
-                        metrics.recordError(error, { 
-                            stepName: step.name,
-                            stepNumber,
-                            isCritical: false 
-                        });
-                    }
-                }
-            }
-        }
-
-        // Calcula estatísticas finais
-        const finalStats = {
-            success: true,
-            message: "Sincronização diária concluída com sucesso",
-            empresa_id: Number(empresa_id),
-            periodo: `${data_inicial} até ${data_final}`,
-            totalSteps: steps.length,
-            ...(metrics && {
-                recordsProcessed: metrics.metrics.recordsProcessed.value,
-                pagesProcessed: metrics.metrics.pagesProcessed.value,
-                errorsCount: metrics.metrics.errorsCount.value,
-                retriesCount: metrics.metrics.retriesCount.value
-            })
-        };
-
-        logOperationEnd('executeDailySync', true, {
-            empresa_id,
-            ...finalStats
-        });
-
-        logger.info('Sincronização diária concluída com sucesso', {
-            ...finalStats,
-            duration: metrics ? `${Date.now() - metrics.startTime}ms` : 'N/A'
-        });
-
-        return finalStats;
-
-    } catch (error) {
-        const errorStats = {
-            success: false,
-            message: "Erro durante a sincronização diária",
-            error: error.message || "Erro desconhecido",
-            empresa_id: Number(empresa_id),
-            ...(metrics && {
-                recordsProcessed: metrics.metrics.recordsProcessed.value,
-                errorsCount: metrics.metrics.errorsCount.value,
-                duration: Date.now() - metrics.startTime
-            })
-        };
-
-        logOperationEnd('executeDailySync', false, {
-            empresa_id,
-            error: error.message
-        });
-
-        logError(error, 'executeDailySync', {
-            empresa_id,
-            ...errorStats
-        });
-
-        return errorStats;
-    }
-}
-
-module.exports = {
-    executeDailySync,
-};
 
 async function step2_syncFornecedores(empresa_id, access_token, refresh_token) {
     const stepName = 'fornecedores';
@@ -488,7 +359,7 @@ async function step2_syncFornecedores(empresa_id, access_token, refresh_token) {
         // Sincronizar Fornecedores
         logger.info('Sincronizando fornecedores por produto', { stepName });
         
-        await syncWithPagination(
+        const fornecedoresResult = await syncWithPagination(
             `${process.env.SUPABASE_URL}/functions/v1/sync_fornecedor_by_productID`,
             { empresa_id: Number(empresa_id), access_token },
             empresa_id, 
@@ -500,7 +371,7 @@ async function step2_syncFornecedores(empresa_id, access_token, refresh_token) {
         // Sincronizar Detalhes dos Fornecedores
         logger.info('Sincronizando detalhes dos fornecedores', { stepName });
         
-        await syncWithPagination(
+        const detalhesResult = await syncWithPagination(
             `${process.env.SUPABASE_URL}/functions/v1/detalhes_fornecedor`,
             { empresa_id: Number(empresa_id), access_token },
             empresa_id, 
@@ -513,9 +384,23 @@ async function step2_syncFornecedores(empresa_id, access_token, refresh_token) {
             metrics.endStep('completed');
         }
 
-        logOperationEnd(`daily-${stepName}`, true, { empresa_id });
+        logOperationEnd(`daily-${stepName}`, true, { 
+            empresa_id,
+            fornecedores: fornecedoresResult.totalRecordsProcessed,
+            detalhes: detalhesResult.totalRecordsProcessed
+        });
 
-        logger.info('Sincronização de fornecedores concluída', { stepName });
+        logger.info('Sincronização de fornecedores concluída', { 
+            stepName,
+            fornecedores: fornecedoresResult.totalRecordsProcessed,
+            detalhes: detalhesResult.totalRecordsProcessed
+        });
+
+        return {
+            fornecedores: fornecedoresResult,
+            detalhes: detalhesResult,
+            totalRecords: fornecedoresResult.totalRecordsProcessed + detalhesResult.totalRecordsProcessed
+        };
 
     } catch (error) {
         if (metrics) {
@@ -624,6 +509,10 @@ async function step3_syncVendasAtuais(empresa_id, access_token, refresh_token) {
             totalDaysProcessed
         });
 
+        return {
+            totalDaysProcessed
+        };
+
     } catch (error) {
         if (metrics) {
             metrics.recordError(error, { stepName });
@@ -697,6 +586,8 @@ async function step4_syncDetalhesVendas(empresa_id, access_token, refresh_token)
             totalRecords: result.totalRecordsProcessed,
             totalPages: result.totalPages
         });
+
+        return result;
 
     } catch (error) {
         if (metrics) {
@@ -809,7 +700,7 @@ async function step5_syncPedidosCompra(empresa_id, access_token, refresh_token) 
         // Sincronização de detalhes dos pedidos de compra
         logger.info('Iniciando sincronização de detalhes de pedidos de compra', { stepName });
         
-        await syncWithPagination(
+        const detalhesResult = await syncWithPagination(
             `${process.env.SUPABASE_URL}/functions/v1/detalhes_pedido_compra`,
             { empresa_id: Number(empresa_id), access_token },
             empresa_id, 
@@ -824,7 +715,7 @@ async function step5_syncPedidosCompra(empresa_id, access_token, refresh_token) 
         // Sincronização das últimas compras
         logger.info('Iniciando sincronização de últimas compras', { stepName });
         
-        await syncWithPagination(
+        const ultimasComprasResult = await syncWithPagination(
             `${process.env.SUPABASE_URL}/functions/v1/sincronizar_ultimas_compras`,
             { empresa_id: Number(empresa_id), access_token },
             empresa_id, 
@@ -843,7 +734,9 @@ async function step5_syncPedidosCompra(empresa_id, access_token, refresh_token) 
         logOperationEnd(`daily-${stepName}`, true, {
             empresa_id,
             processedSuppliers,
-            skippedSuppliers
+            skippedSuppliers,
+            detalhes: detalhesResult.totalRecordsProcessed,
+            ultimasCompras: ultimasComprasResult.totalRecordsProcessed
         });
 
         logger.info('Sincronização de pedidos de compra concluída', {
@@ -851,6 +744,14 @@ async function step5_syncPedidosCompra(empresa_id, access_token, refresh_token) 
             processedSuppliers,
             skippedSuppliers
         });
+
+        return {
+            processedSuppliers,
+            skippedSuppliers,
+            detalhes: detalhesResult,
+            ultimasCompras: ultimasComprasResult,
+            totalRecords: detalhesResult.totalRecordsProcessed + ultimasComprasResult.totalRecordsProcessed
+        };
 
     } catch (error) {
         if (metrics) {
@@ -910,7 +811,7 @@ async function step6_syncNotasFiscais(empresa_id, access_token, refresh_token) {
         await delay(delayTime);
 
         // Sincronizar detalhes das notas fiscais (com paginação)
-        await syncWithPagination(
+        const detalhesNotasResult = await syncWithPagination(
             `${process.env.SUPABASE_URL}/functions/v1/detalhes_nota_fiscal`,
             { empresa_id: Number(empresa_id), access_token },
             empresa_id, 
@@ -1072,7 +973,8 @@ async function step6_syncNotasFiscais(empresa_id, access_token, refresh_token) {
             empresa_id,
             processedNotes,
             erroredNotes,
-            totalNotes: chavesList?.length || 0
+            totalNotes: chavesList?.length || 0,
+            detalhesNotas: detalhesNotasResult.totalRecordsProcessed
         });
 
         logger.info('Sincronização de notas fiscais concluída', {
@@ -1081,6 +983,14 @@ async function step6_syncNotasFiscais(empresa_id, access_token, refresh_token) {
             erroredNotes,
             totalNotes: chavesList?.length || 0
         });
+
+        return {
+            processedNotes,
+            erroredNotes,
+            totalNotes: chavesList?.length || 0,
+            detalhesNotas: detalhesNotasResult,
+            totalRecords: processedNotes + detalhesNotasResult.totalRecordsProcessed
+        };
 
     } catch (error) {
         if (metrics) {
@@ -1093,8 +1003,205 @@ async function step6_syncNotasFiscais(empresa_id, access_token, refresh_token) {
             error: error.message
         });
 
-        logError()(error, `daily-${stepName}`, { empresa_id });
+        // ✅ CORREÇÃO CRÍTICA: Removido o duplo parênteses logError()()
+        logError(error, `daily-${stepName}`, { empresa_id });
         throw error;
-    }}
+    }
+}
 
+// =========================
+// Fluxo Principal
+// =========================
+
+async function executeDailySync(empresa_id, access_token, refresh_token) {
+    const logger = createSyncContext(empresa_id, 'daily', 'main-flow');
+    const metrics = getSyncMetrics(empresa_id, 'daily');
+
+    logOperationStart('executeDailySync', { empresa_id });
+
+    try {
+        // Obtém um token válido
+        access_token = await getValidBlingToken(Number(empresa_id), access_token, refresh_token);
+        
+        logger.info('Token válido obtido para sincronização diária', {
+            tokenPreview: `${access_token.substring(0, 8)}***`
+        });
+
+        const today = new Date();
+        const periodStart = new Date(today);
+        periodStart.setDate(today.getDate() - SYNC.DAILY_PERIOD_DAYS);
+
+        const data_inicial = formatDate(periodStart);
+        const data_final = formatDate(today);
+        
+        logger.info('Iniciando sincronização diária', {
+            empresa_id,
+            periodo: `${data_inicial} até ${data_final}`,
+            totalSteps: 6
+        });
+
+        // Executa as etapas sequencialmente
+        const steps = [
+            { name: 'Produtos', fn: () => step1_syncUltimosProdutos(empresa_id, access_token, refresh_token) },
+            { name: 'Fornecedores', fn: () => step2_syncFornecedores(empresa_id, access_token, refresh_token) },
+            { name: 'Vendas Atuais', fn: () => step3_syncVendasAtuais(empresa_id, access_token, refresh_token) },
+            { name: 'Detalhes Vendas', fn: () => step4_syncDetalhesVendas(empresa_id, access_token, refresh_token) },
+            { name: 'Pedidos Compra', fn: () => step5_syncPedidosCompra(empresa_id, access_token, refresh_token) },
+            { name: 'Notas Fiscais', fn: () => step6_syncNotasFiscais(empresa_id, access_token, refresh_token) }
+        ];
+
+        const stepResults = [];
+        let totalProcessedRecords = 0;
+
+        for (let i = 0; i < steps.length; i++) {
+            const step = steps[i];
+            const stepNumber = i + 1;
+            
+            try {
+                logger.info(`Iniciando etapa ${stepNumber}/6: ${step.name}`, {
+                    stepName: step.name,
+                    stepNumber,
+                    totalSteps: steps.length
+                });
+
+                const stepResult = await step.fn();
+                stepResults.push({
+                    stepName: step.name,
+                    stepNumber,
+                    success: true,
+                    ...stepResult
+                });
+
+                // Acumula total de registros processados
+                totalProcessedRecords += stepResult?.totalRecords || 0;
+
+                logger.info(`Etapa ${stepNumber}/6 concluída: ${step.name}`, {
+                    stepName: step.name,
+                    stepNumber,
+                    recordsProcessed: stepResult?.totalRecords || 0
+                });
+
+                // Delay entre etapas (exceto na última)
+                if (i < steps.length - 1) {
+                    const stepDelayTime = getDelay('steps', 'mini');
+                    logger.debug('Aplicando delay entre etapas', {
+                        currentStep: step.name,
+                        nextStep: steps[i + 1].name,
+                        delayTime: `${stepDelayTime}ms`
+                    });
+                    await delay(stepDelayTime);
+                }
+
+            } catch (error) {
+                stepResults.push({
+                    stepName: step.name,
+                    stepNumber,
+                    success: false,
+                    error: error.message
+                });
+
+                logger.error(`Erro na etapa ${stepNumber}/6: ${step.name}`, {
+                    stepName: step.name,
+                    stepNumber,
+                    error: error.message
+                });
+                
+                // Decide se deve continuar ou parar baseado na criticidade
+                if (stepNumber <= 3) { // Etapas críticas (1-3)
+                    logger.error('Erro em etapa crítica, interrompendo sincronização', {
+                        stepName: step.name,
+                        stepNumber
+                    });
+                    throw error;
+                } else { // Etapas não críticas (4-6)
+                    logger.warn('Erro em etapa não crítica, continuando sincronização', {
+                        stepName: step.name,
+                        stepNumber
+                    });
+                    // Registra erro nas métricas mas continua
+                    if (metrics) {
+                        metrics.recordError(error, { 
+                            stepName: step.name,
+                            stepNumber,
+                            isCritical: false 
+                        });
+                    }
+                }
+            }
+        }
+
+        // Calcula estatísticas finais
+        const finalStats = {
+            success: true,
+            message: "Sincronização diária concluída com sucesso",
+            empresa_id: Number(empresa_id),
+            periodo: `${data_inicial} até ${data_final}`,
+            totalSteps: steps.length,
+            totalRecordsProcessed: totalProcessedRecords,
+            stepResults,
+            ...(metrics && {
+                metricsRecordsProcessed: metrics.metrics.recordsProcessed.value,
+                pagesProcessed: metrics.metrics.pagesProcessed.value,
+                errorsCount: metrics.metrics.errorsCount.value,
+                retriesCount: metrics.metrics.retriesCount.value
+            })
+        };
+
+        logOperationEnd('executeDailySync', true, {
+            empresa_id,
+            ...finalStats
+        });
+
+        logger.info('Sincronização diária concluída com sucesso', {
+            ...finalStats,
+            duration: metrics ? `${Date.now() - metrics.startTime}ms` : 'N/A'
+        });
+
+        return finalStats;
+
+    } catch (error) {
+        const errorStats = {
+            success: false,
+            message: "Erro durante a sincronização diária",
+            error: error.message || "Erro desconhecido",
+            empresa_id: Number(empresa_id),
+            ...(metrics && {
+                recordsProcessed: metrics.metrics.recordsProcessed.value,
+                errorsCount: metrics.metrics.errorsCount.value,
+                duration: Date.now() - metrics.startTime
+            })
+        };
+
+        logOperationEnd('executeDailySync', false, {
+            empresa_id,
+            error: error.message
+        });
+
+        logError(error, 'executeDailySync', {
+            empresa_id,
+            ...errorStats
+        });
+
+        return errorStats;
+    }
+}
+
+// =========================
+// EXPORTAÇÕES
+// =========================
+
+module.exports = {
+    executeDailySync,
     
+    // Funções auxiliares exportadas (para uso em testes ou casos avançados)
+    syncWithPagination,
+    syncRecentData,
+    
+    // Funções de step individuais (para uso no syncService)
+    step1_syncUltimosProdutos,
+    step2_syncFornecedores,
+    step3_syncVendasAtuais,
+    step4_syncDetalhesVendas,
+    step5_syncPedidosCompra,
+    step6_syncNotasFiscais
+};
