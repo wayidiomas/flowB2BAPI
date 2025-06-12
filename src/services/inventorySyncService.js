@@ -1,4 +1,4 @@
-// src/services/inventorySyncService.js - VERSÃO MELHORADA E CONSISTENTE
+// src/services/inventorySyncService.js
 require("dotenv").config();
 const { getDelay, getRetryConfig, SYNC } = require("../config/SyncConfig");
 const delay = require("../utils/delay");
@@ -161,109 +161,56 @@ async function syncEstoqueWithPagination(empresa_id, access_token, refresh_token
 // ===========================
 
 /**
- * ✅ NOVA FUNÇÃO: Executa operações relacionadas ao estoque
+ * ✅ VERSÃO CORRIGIDA: Executa operações relacionadas ao estoque SEM movimentações
  */
 async function executeInventoryOperations(empresa_id, access_token, refresh_token) {
     const stepName = 'inventory-operations';
     const logger = createSyncContext(empresa_id, 'inventory', stepName);
     const metrics = getSyncMetrics(empresa_id, 'inventory');
     
-    logger.info('Iniciando operações completas de inventário', { 
+    logger.info('Iniciando operações de inventário (somente estoque)', { 
         stepName,
-        totalOperations: 2
+        totalOperations: 1 // ✅ CORRIGIDO: Apenas 1 operação agora
     });
 
     const results = {
         estoque: null,
-        movimentacoes: null,
+        movimentacoes: null, // Será null pois não vamos executar
         totalRecords: 0
     };
 
     try {
         // Operação 1: Sincronização de estoque
-        logger.info('Operação 1/2: Sincronizando dados de estoque', { stepName });
+        logger.info('Operação 1/1: Sincronizando dados de estoque', { stepName });
         
         results.estoque = await syncEstoqueWithPagination(empresa_id, access_token, refresh_token);
         results.totalRecords += results.estoque.totalRecordsProcessed;
         
-        logger.info('Operação 1/2 concluída', {
+        logger.info('Operação 1/1 concluída', {
             stepName,
             totalRecords: results.estoque.totalRecordsProcessed,
             totalPages: results.estoque.totalPages
         });
 
-        // Delay entre operações
-        const delayTime = getDelay('steps', 'mini');
-        logger.debug('Delay entre operações de inventário', {
-            stepName,
-            delayTime: `${delayTime}ms`
-        });
-        await delay(delayTime);
-
-        // Operação 2: Sincronização de movimentações de estoque (se disponível)
-        logger.info('Operação 2/2: Sincronizando movimentações de estoque', { stepName });
+        // ✅ REMOVIDO: Operação 2 (movimentações) que causava o erro 404
+        // A Edge Function 'sync_movimentacoes_estoque' não existe no Supabase
+        results.movimentacoes = {
+            totalRecordsProcessed: 0,
+            success: false,
+            error: "Edge Function não disponível - sync_movimentacoes_estoque não encontrada",
+            skipped: true
+        };
         
-        try {
-            const movimentacoesResult = await callEdgeFunction(
-                `${process.env.SUPABASE_URL}/functions/v1/sync_movimentacoes_estoque`,
-                { 
-                    empresa_id: Number(empresa_id),
-                    access_token
-                },
-                empresa_id,
-                access_token,
-                refresh_token,
-                { 
-                    context: 'default',
-                    maxRetries: 10,
-                    initialDelay: 2000,
-                    backoffFactor: 1.5
-                }
-            );
-            
-            results.movimentacoes = {
-                totalRecordsProcessed: movimentacoesResult?.recordsProcessed || 0,
-                success: true
-            };
-            
-            results.totalRecords += results.movimentacoes.totalRecordsProcessed;
-            
-            if (metrics) {
-                metrics.recordsProcessed(results.movimentacoes.totalRecordsProcessed);
-            }
-            
-            logger.info('Operação 2/2 concluída', {
-                stepName,
-                totalRecords: results.movimentacoes.totalRecordsProcessed
-            });
-            
-        } catch (movError) {
-            // Movimentações são opcionais, registra erro mas continua
-            results.movimentacoes = {
-                totalRecordsProcessed: 0,
-                success: false,
-                error: movError.message
-            };
-            
-            if (metrics) {
-                metrics.recordError(movError, { 
-                    stepName, 
-                    operation: 'movimentacoes_estoque',
-                    optional: true 
-                });
-            }
-            
-            logger.warn('Operação 2/2 falhou (opcional)', {
-                stepName,
-                error: movError.message
-            });
-        }
+        logger.info('Operação 2 ignorada (Edge Function não disponível)', {
+            stepName,
+            reason: "sync_movimentacoes_estoque não encontrada no Supabase"
+        });
 
         logger.info('Operações de inventário concluídas', {
             stepName,
             totalRecords: results.totalRecords,
             estoqueRecords: results.estoque.totalRecordsProcessed,
-            movimentacoesRecords: results.movimentacoes?.totalRecordsProcessed || 0
+            movimentacoesRecords: 0 // Sempre 0 agora
         });
 
         return results;
@@ -282,8 +229,7 @@ async function executeInventoryOperations(empresa_id, access_token, refresh_toke
 // ===========================
 
 /**
- * Executa sincronização completa de estoque (inventário)
- * Versão melhorada com operações múltiplas
+ * ✅ VERSÃO CORRIGIDA: Executa sincronização completa de estoque (inventário)
  */
 async function executeInventorySync(empresa_id, access_token, refresh_token) {
     const logger = createSyncContext(empresa_id, 'inventory', 'main-flow');
@@ -296,10 +242,10 @@ async function executeInventorySync(empresa_id, access_token, refresh_token) {
     }
 
     try {
-        logger.info('Iniciando sincronização completa de inventário', {
+        logger.info('Iniciando sincronização de inventário (somente estoque)', {
             empresa_id,
             operation: 'executeInventorySync',
-            includeMovements: true
+            includeMovements: false // ✅ CORRIGIDO: Agora é false
         });
 
         // Obtém um token válido
@@ -309,7 +255,7 @@ async function executeInventorySync(empresa_id, access_token, refresh_token) {
             tokenPreview: `${token.substring(0, 8)}***`
         });
 
-        // Executa as operações completas de inventário
+        // Executa as operações de inventário (somente estoque)
         const inventoryResults = await executeInventoryOperations(empresa_id, token, refresh_token);
 
         // Calcula estatísticas finais
@@ -325,16 +271,11 @@ async function executeInventorySync(empresa_id, access_token, refresh_token) {
                     pages: inventoryResults.estoque.totalPages,
                     success: true
                 },
-                movimentacoes: inventoryResults.movimentacoes ? {
-                    records: inventoryResults.movimentacoes.totalRecordsProcessed,
-                    success: inventoryResults.movimentacoes.success,
-                    ...(inventoryResults.movimentacoes.error && { 
-                        error: inventoryResults.movimentacoes.error 
-                    })
-                } : {
+                movimentacoes: {
                     records: 0,
                     success: false,
-                    error: "Operação não executada"
+                    skipped: true,
+                    reason: "Edge Function não disponível"
                 }
             },
             ...(metrics && {
@@ -498,7 +439,7 @@ async function executeSimpleInventorySync(empresa_id, access_token, refresh_toke
 // ===========================
 
 /**
- * ✅ NOVA FUNÇÃO: Obtém estatísticas do inventário
+ * ✅ FUNÇÃO ATUALIZADA: Obtém estatísticas do inventário
  */
 function getInventoryStats(empresa_id) {
     const metrics = getSyncMetrics(empresa_id, 'inventory');
@@ -522,7 +463,7 @@ function getInventoryStats(empresa_id) {
 }
 
 /**
- * ✅ NOVA FUNÇÃO: Verifica se sincronização de inventário está ativa
+ * ✅ FUNÇÃO ATUALIZADA: Verifica se sincronização de inventário está ativa
  */
 function isInventorySyncActive(empresa_id) {
     const stats = getInventoryStats(empresa_id);
@@ -534,7 +475,7 @@ function isInventorySyncActive(empresa_id) {
 // ===========================
 
 module.exports = {
-    // Função principal (versão completa)
+    // Função principal (versão corrigida)
     executeInventorySync,
     
     // Função simplificada (compatibilidade)
