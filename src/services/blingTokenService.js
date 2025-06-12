@@ -1,4 +1,4 @@
-// src/services/blingTokenService.js - VERSÃO COMPLETAMENTE CORRIGIDA
+// src/services/blingTokenService.js - VERSÃO CORRIGIDA PARA RESOLVER "Project not specified"
 const axios = require("axios");
 const FormData = require("form-data");
 const supabase = require("./supabaseService");
@@ -56,8 +56,41 @@ class TokenManager {
             mutexTimeout: `${MUTEX_TIMEOUT}ms`
         });
 
+        // ✅ CORREÇÃO: Verifica conexão Supabase na inicialização
+        this._validateSupabaseConnection();
+
         // Inicia limpeza automática de mutex travados
         this._startMutexCleanupTimer();
+    }
+
+    /**
+     * ✅ NOVA FUNÇÃO: Valida conexão com Supabase na inicialização
+     */
+    async _validateSupabaseConnection() {
+        try {
+            // Testa conexão básica sem afetar dados
+            const testQuery = await supabase
+                .from('bling_tokens')
+                .select('count', { count: 'exact', head: true });
+            
+            if (testQuery.error) {
+                this.logger.error('❌ Falha na conexão inicial com Supabase', {
+                    operation: 'validateSupabaseConnection',
+                    error: testQuery.error.message,
+                    details: testQuery.error.details || 'N/A',
+                    hint: testQuery.error.hint || 'N/A'
+                });
+            } else {
+                this.logger.info('✅ Conexão com Supabase validada', {
+                    operation: 'validateSupabaseConnection'
+                });
+            }
+        } catch (error) {
+            this.logger.error('❌ Erro crítico na validação do Supabase', {
+                operation: 'validateSupabaseConnection',
+                error: error.message
+            });
+        }
     }
 
     /**
@@ -563,12 +596,17 @@ class TokenManager {
     }
 
     /**
-     * ✅ FUNÇÃO COMPLETAMENTE CORRIGIDA: Salva token com normalização de timezone
+     * ✅ FUNÇÃO COMPLETAMENTE CORRIGIDA: Salva token com validação do Supabase
      */
     async _saveTokenToDB(empresa_id, access_token, refresh_token, expires_at) {
         const logger = createTokenContext(empresa_id);
         
         try {
+            // ✅ VALIDAÇÃO PRÉVIA: Verifica se Supabase está disponível
+            if (!supabase) {
+                throw new Error('Cliente Supabase não está disponível');
+            }
+
             // ✅ NORMALIZAÇÃO: Converte para timestamp UTC consistente
             const normalizedExpiresAt = new Date(expires_at).toISOString();
             
@@ -578,12 +616,13 @@ class TokenManager {
                 tokenPreview: `${access_token.substring(0, 8)}***`
             });
             
+            // ✅ CORREÇÃO CRÍTICA: Tenta operação com tratamento detalhado de erro
             const { data, error } = await supabase.from("bling_tokens").upsert(
                 {
                     empresa_id,
                     access_token,
                     refresh_token,
-                    expires_at: normalizedExpiresAt, // ✅ USA DATA NORMALIZADA
+                    expires_at: normalizedExpiresAt,
                     updated_at: new Date().toISOString()
                 },
                 { 
@@ -592,7 +631,20 @@ class TokenManager {
                 }
             );
 
-            if (error) throw error;
+            if (error) {
+                logger.error('Erro detalhado do Supabase ao salvar token', {
+                    operation: 'saveTokenToDB',
+                    supabaseError: {
+                        message: error.message,
+                        details: error.details || 'N/A',
+                        hint: error.hint || 'N/A',
+                        code: error.code || 'N/A'
+                    },
+                    empresa_id,
+                    hasSupabaseClient: !!supabase
+                });
+                throw error;
+            }
             
             // ✅ VALIDAÇÃO MELHORADA: Compara timestamps numericamente
             const savedToken = await this._getTokenFromDB(empresa_id);
@@ -619,28 +671,60 @@ class TokenManager {
             });
             
         } catch (error) {
+            // ✅ LOG DETALHADO PARA TROUBLESHOOTING
+            logger.error('Erro crítico ao salvar token no banco', {
+                operation: 'saveTokenToDB',
+                error: error.message,
+                errorCode: error.code || 'N/A',
+                errorDetails: error.details || 'N/A',
+                errorHint: error.hint || 'N/A',
+                empresa_id,
+                hasSupabaseClient: !!supabase,
+                expiresAt: expires_at?.toISOString?.() || expires_at
+            });
+
             logError(error, 'saveTokenToDB', { 
                 empresa_id,
-                expiresAt: expires_at?.toISOString?.() || expires_at
+                expiresAt: expires_at?.toISOString?.() || expires_at,
+                supabaseAvailable: !!supabase
             });
             throw error;
         }
     }
 
     /**
-     * ✅ FUNÇÃO MELHORADA: Busca token com normalização automática de data
+     * ✅ FUNÇÃO MELHORADA: Busca token com validação robusta do Supabase
      */
     async _getTokenFromDB(empresa_id) {
         const logger = createTokenContext(empresa_id);
         
         try {
+            // ✅ VALIDAÇÃO PRÉVIA: Verifica se Supabase está disponível
+            if (!supabase) {
+                throw new Error('Cliente Supabase não está disponível');
+            }
+
             const { data, error } = await supabase
                 .from("bling_tokens")
                 .select("access_token, refresh_token, expires_at")
                 .eq("empresa_id", empresa_id)
                 .maybeSingle();
 
-            if (error) throw error;
+            if (error) {
+                // ✅ LOG DETALHADO PARA TROUBLESHOOTING
+                logger.error('Erro detalhado do Supabase ao buscar token', {
+                    operation: 'getTokenFromDB',
+                    supabaseError: {
+                        message: error.message,
+                        details: error.details || 'N/A',
+                        hint: error.hint || 'N/A',
+                        code: error.code || 'N/A'
+                    },
+                    empresa_id,
+                    hasSupabaseClient: !!supabase
+                });
+                throw error;
+            }
             
             // ✅ NORMALIZAÇÃO AUTOMÁTICA: Garante formato ISO consistente
             if (data && data.expires_at) {
@@ -666,7 +750,21 @@ class TokenManager {
             
             return data;
         } catch (error) {
-            logError(error, 'getTokenFromDB', { empresa_id });
+            // ✅ LOG DETALHADO PARA TROUBLESHOOTING
+            logger.error('Erro crítico ao buscar token no banco', {
+                operation: 'getTokenFromDB',
+                error: error.message,
+                errorCode: error.code || 'N/A',
+                errorDetails: error.details || 'N/A',
+                errorHint: error.hint || 'N/A',
+                empresa_id,
+                hasSupabaseClient: !!supabase
+            });
+
+            logError(error, 'getTokenFromDB', { 
+                empresa_id,
+                supabaseAvailable: !!supabase
+            });
             throw error;
         }
     }
@@ -950,6 +1048,39 @@ module.exports = {
     },
     
     /**
+     * ✅ NOVA FUNÇÃO: Teste de conectividade do Supabase
+     */
+    testSupabaseConnection: async () => {
+        try {
+            const testQuery = await supabase
+                .from('bling_tokens')
+                .select('count', { count: 'exact', head: true });
+            
+            if (testQuery.error) {
+                return {
+                    success: false,
+                    error: testQuery.error.message,
+                    details: testQuery.error.details || 'N/A',
+                    hint: testQuery.error.hint || 'N/A',
+                    code: testQuery.error.code || 'N/A'
+                };
+            }
+            
+            return {
+                success: true,
+                message: 'Conexão com Supabase OK',
+                timestamp: new Date().toISOString()
+            };
+        } catch (error) {
+            return {
+                success: false,
+                error: error.message,
+                timestamp: new Date().toISOString()
+            };
+        }
+    },
+    
+    /**
      * Executa diagnóstico completo do sistema de tokens
      */
     runDiagnostics: async () => {
@@ -961,6 +1092,7 @@ module.exports = {
                 uptime: process.uptime(),
                 memoryUsage: process.memoryUsage()
             },
+            supabase: await module.exports.testSupabaseConnection(),
             tokenManager: {
                 stats: tokenManager.getStats(),
                 health: tokenManager.getHealthStatus(),
@@ -976,6 +1108,12 @@ module.exports = {
         
         // Análise e recomendações
         const health = diagnostics.tokenManager.health;
+        
+        if (!diagnostics.supabase.success) {
+            diagnostics.recommendations.push(
+                `❌ CRÍTICO: Falha na conexão Supabase - ${diagnostics.supabase.error}`
+            );
+        }
         
         if (health.status !== 'healthy') {
             diagnostics.recommendations.push(
@@ -1003,7 +1141,7 @@ module.exports = {
         }
         
         if (diagnostics.recommendations.length === 0) {
-            diagnostics.recommendations.push('Sistema funcionando normalmente');
+            diagnostics.recommendations.push('✅ Sistema funcionando normalmente');
         }
         
         return diagnostics;
