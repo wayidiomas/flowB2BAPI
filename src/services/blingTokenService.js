@@ -1,4 +1,4 @@
-// src/services/blingTokenService.js
+// src/services/blingTokenService.js - VERSÃO CORRIGIDA
 const axios = require("axios");
 const FormData = require("form-data");
 const supabase = require("./supabaseService");
@@ -32,7 +32,10 @@ class TokenManager {
             successfulRenewals: 0,
             failedRenewals: 0,
             averageRenewalTime: 0,
-            lastRenewalTime: null
+            lastRenewalTime: null,
+            // ✅ NOVA MÉTRICA: Para tracking de problemas
+            mutexTimeouts: 0,
+            mutexClears: 0
         };
 
         // Logger contexto para tokens
@@ -46,24 +49,82 @@ class TokenManager {
     }
 
     /**
-     * Obtém token válido com controle de concorrência
+     * ✅ FUNÇÃO CORRIGIDA: Obtém token válido com controle de concorrência
      */
     async getValidToken(empresa_id, accessToken = null, refresh_token = null) {
         const key = `empresa_${empresa_id}`;
         const logger = createTokenContext(empresa_id);
         
-        // Previne renovações concorrentes
+        // 🐛 DEBUG: Log entrada da função
+        logger.debug('getValidToken chamado', {
+            operation: 'getValidToken',
+            hasAccessToken: !!accessToken,
+            hasRefreshToken: !!refresh_token,
+            mutexExists: this.renewalMutex.has(key),
+            activeRenewals: this.renewalIntervals.size
+        });
+        
+        // ✅ FIX: Timeout para mutex travado
         if (this.renewalMutex.has(key)) {
             logger.info('Aguardando renovação em progresso', {
                 operation: 'getValidToken',
                 status: 'waiting'
             });
             
-            await this.renewalMutex.get(key);
+            try {
+                // ✅ PROTEÇÃO: Timeout de 30 segundos para mutex
+                const mutexPromise = this.renewalMutex.get(key);
+                const timeoutPromise = new Promise((_, reject) => {
+                    setTimeout(() => reject(new Error('Mutex timeout - possível deadlock')), 30000);
+                });
+                
+                await Promise.race([mutexPromise, timeoutPromise]);
+                
+                // ✅ PÓS-MUTEX: Busca token atualizado do banco
+                const updatedToken = await this._getTokenFromDB(empresa_id);
+                if (updatedToken?.access_token) {
+                    logger.debug('Token obtido após aguardar mutex', {
+                        operation: 'getValidToken',
+                        tokenPreview: `${updatedToken.access_token.substring(0, 8)}***`
+                    });
+                    
+                    // ✅ REAGENDA: Garante que agendamento está ativo
+                    if (updatedToken.expires_at) {
+                        const expiresAt = new Date(updatedToken.expires_at);
+                        const timeUntilExpiry = expiresAt.getTime() - Date.now();
+                        if (timeUntilExpiry > this.TOKEN_EXPIRATION_BUFFER) {
+                            this._scheduleRenewal(empresa_id, updatedToken.refresh_token, timeUntilExpiry);
+                        }
+                    }
+                    
+                    return updatedToken.access_token;
+                }
+                
+            } catch (error) {
+                // ✅ MUTEX TRAVADO: Remove e continua
+                logger.warn('Mutex timeout ou erro, removendo mutex travado', {
+                    operation: 'getValidToken',
+                    error: error.message,
+                    mutexKey: key
+                });
+                
+                this.renewalMutex.delete(key);
+                this.stats.mutexTimeouts++;
+                
+                // Continua com a lógica normal após remover mutex travado
+            }
         }
 
         try {
             const tokenData = await this._getTokenFromDB(empresa_id);
+            
+            // 🐛 DEBUG: Log token do banco
+            logger.debug('Token lido do banco', {
+                operation: 'getValidToken',
+                hasToken: !!tokenData,
+                expiresAt: tokenData?.expires_at,
+                tokenPreview: tokenData?.access_token ? `${tokenData.access_token.substring(0, 8)}***` : null
+            });
             
             if (!tokenData || !tokenData.expires_at) {
                 logger.warn('Token não encontrado ou sem data de expiração', {
@@ -77,6 +138,17 @@ class TokenManager {
             const expiresAt = new Date(tokenData.expires_at);
             const now = new Date();
             const timeUntilExpiry = expiresAt.getTime() - now.getTime();
+
+            // 🐛 DEBUG: Log cálculo de expiração
+            logger.debug('Cálculo de expiração', {
+                operation: 'getValidToken',
+                expiresAt: expiresAt.toISOString(),
+                currentTime: now.toISOString(),
+                timeUntilExpiry,
+                timeUntilExpiryMinutes: Math.round(timeUntilExpiry / 1000 / 60),
+                expirationBuffer: this.TOKEN_EXPIRATION_BUFFER,
+                shouldRenew: timeUntilExpiry <= this.TOKEN_EXPIRATION_BUFFER
+            });
 
             // Só renova se realmente precisar
             if (timeUntilExpiry <= this.TOKEN_EXPIRATION_BUFFER) {
@@ -108,20 +180,45 @@ class TokenManager {
     }
 
     /**
-     * Renova token com mutex para evitar concorrência
+     * ✅ FUNÇÃO CORRIGIDA: Renova token com mutex para evitar concorrência
      */
     async _renewToken(empresa_id, refresh_token) {
         const key = `empresa_${empresa_id}`;
         const logger = createTokenContext(empresa_id);
         
-        // Se já está renovando, aguarda
+        // 🐛 DEBUG: Log entrada da função
+        logger.debug('_renewToken chamado', {
+            operation: 'renewToken',
+            hasRefreshToken: !!refresh_token,
+            mutexExists: this.renewalMutex.has(key)
+        });
+        
+        // Se já está renovando, aguarda COM TIMEOUT
         if (this.renewalMutex.has(key)) {
             logger.debug('Aguardando renovação já em progresso');
-            await this.renewalMutex.get(key);
             
-            // Busca token atualizado do banco
-            const tokenData = await this._getTokenFromDB(empresa_id);
-            return tokenData?.access_token;
+            try {
+                const mutexPromise = this.renewalMutex.get(key);
+                const timeoutPromise = new Promise((_, reject) => {
+                    setTimeout(() => reject(new Error('Renewal mutex timeout')), 30000);
+                });
+                
+                await Promise.race([mutexPromise, timeoutPromise]);
+                
+                // Busca token atualizado do banco
+                const tokenData = await this._getTokenFromDB(empresa_id);
+                return tokenData?.access_token;
+                
+            } catch (error) {
+                logger.warn('Timeout em mutex de renovação, removendo', {
+                    operation: 'renewToken',
+                    error: error.message
+                });
+                
+                this.renewalMutex.delete(key);
+                this.stats.mutexTimeouts++;
+                // Continua com renovação normal
+            }
         }
 
         // Cria mutex e registra no rate limiter
@@ -134,14 +231,27 @@ class TokenManager {
         try {
             const result = await renewalPromise;
             return result.access_token;
+        } catch (error) {
+            // ✅ LOG: Registra erro de renovação
+            logger.error('Erro na renovação de token', {
+                operation: 'renewToken',
+                error: error.message
+            });
+            throw error;
         } finally {
-            // Remove mutex
+            // ✅ GARANTIA: Remove mutex SEMPRE
             this.renewalMutex.delete(key);
+            this.stats.mutexClears++;
+            
+            logger.debug('Mutex removido', {
+                operation: 'renewToken',
+                mutexKey: key
+            });
         }
     }
 
     /**
-     * Executa a renovação real com rate limiting e logging
+     * ✅ FUNÇÃO CORRIGIDA: Executa a renovação real com rate limiting e logging
      */
     async _performRenewal(empresa_id, refresh_token) {
         const logger = createTokenContext(empresa_id);
@@ -185,11 +295,20 @@ class TokenManager {
             const { access_token, refresh_token: new_refresh_token, expires_in } = result;
             const expires_at = new Date(Date.now() + expires_in * 1000);
 
-            // Salva no banco
+            // 🐛 DEBUG: Log dados da resposta do Bling
+            logger.debug('Resposta do Bling recebida', {
+                operation: 'performRenewal',
+                expires_in,
+                expires_at: expires_at.toISOString(),
+                tokenPreview: `${access_token.substring(0, 8)}***`
+            });
+
+            // ✅ SALVA: No banco com validação
             await this._saveTokenToDB(empresa_id, access_token, new_refresh_token, expires_at);
 
-            // Agenda próxima renovação
-            this._scheduleRenewal(empresa_id, new_refresh_token, expires_in * 1000);
+            // ✅ FIX: Usa timeUntilExpiry correto, não expires_in * 1000
+            const timeUntilExpiry = expires_at.getTime() - Date.now();
+            this._scheduleRenewal(empresa_id, new_refresh_token, timeUntilExpiry);
 
             // Atualiza estatísticas
             const renewalTime = Date.now() - startTime;
@@ -201,13 +320,15 @@ class TokenManager {
                 empresa_id,
                 renewalTime: `${renewalTime}ms`,
                 expiresAt: expires_at.toISOString(),
-                tokenPreview: `${access_token.substring(0, 8)}***`
+                tokenPreview: `${access_token.substring(0, 8)}***`,
+                expires_in
             });
 
             logger.info('Token renovado com sucesso', {
                 operation: 'performRenewal',
                 renewalTime: `${renewalTime}ms`,
-                expiresIn: `${expires_in}s`
+                expiresIn: `${expires_in}s`,
+                expiresAt: expires_at.toISOString()
             });
 
             return tokenResult;
@@ -233,10 +354,35 @@ class TokenManager {
     }
 
     /**
-     * Agenda renovação com limpeza automática
+     * ✅ FUNÇÃO CORRIGIDA: Agenda renovação com limpeza automática
      */
     _scheduleRenewal(empresa_id, refresh_token, timeUntilExpiry) {
         const logger = createTokenContext(empresa_id);
+        
+        // 🐛 DEBUG: Log entrada da função
+        const debugInfo = {
+            empresa_id,
+            timeUntilExpiry,
+            timeUntilExpiryMinutes: Math.round(timeUntilExpiry / 1000 / 60),
+            expirationBuffer: this.TOKEN_EXPIRATION_BUFFER,
+            expirationBufferMinutes: Math.round(this.TOKEN_EXPIRATION_BUFFER / 1000 / 60),
+            currentTime: new Date().toISOString()
+        };
+        
+        logger.debug('_scheduleRenewal chamado', {
+            operation: 'scheduleRenewal',
+            ...debugInfo
+        });
+        
+        // ✅ VALIDAÇÃO: Verifica se timeUntilExpiry é válido
+        if (!timeUntilExpiry || timeUntilExpiry <= 0 || !isFinite(timeUntilExpiry)) {
+            logger.error('timeUntilExpiry inválido, não agendando renovação', {
+                operation: 'scheduleRenewal',
+                timeUntilExpiry,
+                debugInfo
+            });
+            return;
+        }
         
         // Limpa agendamento anterior
         this.clearRenewal(empresa_id);
@@ -244,18 +390,36 @@ class TokenManager {
         // Agenda para X minutos antes de expirar
         const renewalTime = Math.max(timeUntilExpiry - this.TOKEN_EXPIRATION_BUFFER, 60000);
         const renewalMinutes = Math.round(renewalTime / 1000 / 60);
+        const renewalAt = new Date(Date.now() + renewalTime);
+        
+        // 🐛 DEBUG: Log cálculo do agendamento
+        logger.debug('Cálculo de agendamento', {
+            operation: 'scheduleRenewal',
+            renewalTime,
+            renewalMinutes,
+            renewalAt: renewalAt.toISOString(),
+            calculation: {
+                step1_timeUntilExpiry: timeUntilExpiry,
+                step2_minusBuffer: timeUntilExpiry - this.TOKEN_EXPIRATION_BUFFER,
+                step3_maxWith60s: Math.max(timeUntilExpiry - this.TOKEN_EXPIRATION_BUFFER, 60000),
+                step4_finalTimestamp: Date.now() + renewalTime
+            }
+        });
         
         logger.info('Agendando renovação automática', {
             operation: 'scheduleRenewal',
             renewalInMinutes: renewalMinutes,
-            renewalAt: new Date(Date.now() + renewalTime).toISOString()
+            renewalAt: renewalAt.toISOString()
         });
         
         const intervalId = setTimeout(async () => {
             const scheduleLogger = createTokenContext(empresa_id);
             
             try {
-                scheduleLogger.info('Executando renovação agendada');
+                scheduleLogger.info('Executando renovação agendada', {
+                    scheduledFor: renewalAt.toISOString(),
+                    actualTime: new Date().toISOString()
+                });
                 await this._renewToken(empresa_id, refresh_token);
             } catch (error) {
                 logError(error, 'scheduledRenewal', { empresa_id });
@@ -266,6 +430,64 @@ class TokenManager {
         }, renewalTime);
 
         this.renewalIntervals.set(empresa_id, intervalId);
+        
+        // 🐛 DEBUG: Log final do agendamento
+        logger.debug('Renovação agendada com sucesso', {
+            operation: 'scheduleRenewal',
+            intervalId: intervalId.toString().substring(0, 10) + '...',
+            activeRenewals: this.renewalIntervals.size
+        });
+    }
+
+    /**
+     * ✅ FUNÇÃO CORRIGIDA: Salva token no banco com validação
+     */
+    async _saveTokenToDB(empresa_id, access_token, refresh_token, expires_at) {
+        const logger = createTokenContext(empresa_id);
+        
+        try {
+            // 🐛 DEBUG: Log antes de salvar
+            logger.debug('Salvando token no banco', {
+                operation: 'saveTokenToDB',
+                expiresAt: expires_at.toISOString(),
+                tokenPreview: `${access_token.substring(0, 8)}***`
+            });
+            
+            const { data, error } = await supabase.from("bling_tokens").upsert(
+                {
+                    empresa_id,
+                    access_token,
+                    refresh_token,
+                    expires_at: expires_at.toISOString(),
+                    updated_at: new Date().toISOString()
+                },
+                { 
+                    onConflict: ["empresa_id"],
+                    returning: "minimal" // ✅ Para confirmar que foi salvo
+                }
+            );
+
+            if (error) throw error;
+            
+            // ✅ VALIDAÇÃO: Confirma que foi salvo lendo de volta
+            const savedToken = await this._getTokenFromDB(empresa_id);
+            if (!savedToken || savedToken.expires_at !== expires_at.toISOString()) {
+                throw new Error(`Token não foi salvo corretamente. Expected: ${expires_at.toISOString()}, Got: ${savedToken?.expires_at}`);
+            }
+            
+            logger.debug('Token salvo e validado no banco', {
+                operation: 'saveTokenToDB',
+                expiresAt: expires_at.toISOString(),
+                validated: true
+            });
+            
+        } catch (error) {
+            logError(error, 'saveTokenToDB', { 
+                empresa_id,
+                expiresAt: expires_at?.toISOString()
+            });
+            throw error;
+        }
     }
 
     /**
@@ -300,7 +522,7 @@ class TokenManager {
         }
         
         this.renewalIntervals.clear();
-        this.renewalMutex.clear();
+        this.renewalMutex.clear(); // ✅ Também limpa mutex
         
         this.logger.info('Todos os agendamentos removidos', {
             operation: 'clearAllRenewals',
@@ -337,41 +559,7 @@ class TokenManager {
     }
 
     /**
-     * Salva token no banco com logging
-     */
-    async _saveTokenToDB(empresa_id, access_token, refresh_token, expires_at) {
-        const logger = createTokenContext(empresa_id);
-        
-        try {
-            const { error } = await supabase.from("bling_tokens").upsert(
-                {
-                    empresa_id,
-                    access_token,
-                    refresh_token,
-                    expires_at: expires_at.toISOString(),
-                    updated_at: new Date().toISOString()
-                },
-                { onConflict: ["empresa_id"] }
-            );
-
-            if (error) throw error;
-            
-            logger.debug('Token salvo no banco', {
-                operation: 'saveTokenToDB',
-                expiresAt: expires_at.toISOString()
-            });
-            
-        } catch (error) {
-            logError(error, 'saveTokenToDB', { 
-                empresa_id,
-                expiresAt: expires_at?.toISOString()
-            });
-            throw error;
-        }
-    }
-
-    /**
-     * Atualiza estatísticas do token manager
+     * ✅ FUNÇÃO ATUALIZADA: Atualiza estatísticas do token manager
      */
     _updateStats(success, renewalTime) {
         this.stats.totalRenewals++;
@@ -391,7 +579,7 @@ class TokenManager {
     }
 
     /**
-     * Obtém estatísticas do token manager
+     * ✅ FUNÇÃO ATUALIZADA: Obtém estatísticas do token manager
      */
     getStats() {
         return {
@@ -411,10 +599,16 @@ class TokenManager {
     getHealthStatus() {
         const stats = this.getStats();
         const recentFailures = this.stats.failedRenewals > this.stats.successfulRenewals * 0.1; // Mais de 10% de falhas
+        const hasTimeouts = this.stats.mutexTimeouts > 0;
         
         return {
-            status: recentFailures ? 'warning' : 'healthy',
+            status: recentFailures || hasTimeouts ? 'warning' : 'healthy',
             stats,
+            issues: {
+                recentFailures,
+                hasTimeouts,
+                pendingMutex: this.renewalMutex.size > 0
+            },
             timestamp: new Date().toISOString()
         };
     }
