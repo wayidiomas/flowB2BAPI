@@ -251,8 +251,9 @@ function shouldRetry(statusCode, currentRetry, maxRetries, retryOnHttpCodes) {
 
 /**
  * Trata lógica de retry com logging
+ * CORREÇÃO: Renomeado o parâmetro 'delay' para 'delayTime' para evitar conflito
  */
-async function handleRetry(error, retryCount, delay, logger, endpoint) {
+async function handleRetry(error, retryCount, delayTime, logger, endpoint) {
   const isTimeoutError = 
     (error.status === 500 || error.status === 503 || error.status === 504) && 
     (error.message?.includes('timeout') || error.message?.includes('cancelling statement'));
@@ -262,13 +263,14 @@ async function handleRetry(error, retryCount, delay, logger, endpoint) {
     attempt: retryCount + 1,
     error: error.message,
     isTimeout: isTimeoutError,
-    nextRetryIn: `${delay}ms`
+    nextRetryIn: `${delayTime}ms`
   });
 
   // Registra retry no rate limiter para estatísticas
   rateLimiterManager.recordError('supabase', error, endpoint);
 
-  await delay(delay);
+  // Usa a função delay importada corretamente
+  await delay(delayTime);
 }
 
 /**
