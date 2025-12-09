@@ -275,29 +275,30 @@ async function step1_syncUltimosProdutos(empresa_id, access_token, refresh_token
         logger.info('Iniciando sincronização de produtos e detalhes (daily)', {
             stepName,
             paginaAtual,
-            totalSubSteps: 2
+            totalSubSteps: 3
         });
 
-        // Sub-etapa 1.1: Sincronizar produtos usando quantidade (< 100 para encerrar)
-        logger.info('Sub-etapa 1.1: Sincronizando produtos', { stepName });
+        // Sub-etapa 1.1: Sincronizar produtos ATIVOS (criterio=2)
+        logger.info('🟢 Sub-etapa 1.1: Sincronizando produtos ATIVOS (criterio=2)', { stepName });
 
-        const produtosResult = await syncWithPagination(
+        const produtosAtivosResult = await syncWithPagination(
             `${process.env.SUPABASE_URL}/functions/v1/sync_prod_2`,
             {
                 empresa_id: Number(empresa_id),
                 access_token: access_token,
-                page: paginaAtual
+                page: paginaAtual,
+                criterio: 2 // ✅ Apenas produtos ativos
             },
             empresa_id,
             refresh_token,
             true, // ✅ Controla paginação usando 'quantidade'
-            `${stepName}-sync`
+            `${stepName}-ativos`
         );
 
-        logger.info('Sub-etapa 1.1 concluída', {
+        logger.info('Sub-etapa 1.1 concluída - Produtos ativos sincronizados', {
             stepName,
-            totalRecords: produtosResult.totalRecordsProcessed,
-            totalPages: produtosResult.totalPages
+            totalRecords: produtosAtivosResult.totalRecordsProcessed,
+            totalPages: produtosAtivosResult.totalPages
         });
 
         // Delay entre sub-etapas
@@ -308,8 +309,34 @@ async function step1_syncUltimosProdutos(empresa_id, access_token, refresh_token
         });
         await delay(miniDelayTime);
 
-        // Sub-etapa 1.2: Sincronizar detalhes do produto usando next_page
-        logger.info('Sub-etapa 1.2: Sincronizando detalhes dos produtos', { stepName });
+        // Sub-etapa 1.2: Sincronizar produtos INATIVOS (criterio=3)
+        logger.info('🔴 Sub-etapa 1.2: Sincronizando produtos INATIVOS (criterio=3)', { stepName });
+
+        const produtosInativosResult = await syncWithPagination(
+            `${process.env.SUPABASE_URL}/functions/v1/sync_prod_2`,
+            {
+                empresa_id: Number(empresa_id),
+                access_token: access_token,
+                page: 1, // ✅ Sempre começa da página 1 para inativos
+                criterio: 3 // ✅ Apenas produtos inativos
+            },
+            empresa_id,
+            refresh_token,
+            true, // ✅ Controla paginação usando 'quantidade'
+            `${stepName}-inativos`
+        );
+
+        logger.info('Sub-etapa 1.2 concluída - Produtos inativos sincronizados', {
+            stepName,
+            totalRecords: produtosInativosResult.totalRecordsProcessed,
+            totalPages: produtosInativosResult.totalPages
+        });
+
+        // Delay entre sub-etapas
+        await delay(miniDelayTime);
+
+        // Sub-etapa 1.3: Sincronizar detalhes de TODOS os produtos usando next_page
+        logger.info('📋 Sub-etapa 1.3: Sincronizando detalhes de TODOS os produtos', { stepName });
 
         const detalhesResult = await syncWithPagination(
             `${process.env.SUPABASE_URL}/functions/v1/sync_detalhes_prod`,
@@ -323,16 +350,17 @@ async function step1_syncUltimosProdutos(empresa_id, access_token, refresh_token
             `${stepName}-detalhes`
         );
 
-        logger.info('Sub-etapa 1.2 concluída', {
+        logger.info('Sub-etapa 1.3 concluída - Detalhes sincronizados', {
             stepName,
             totalRecords: detalhesResult.totalRecordsProcessed,
             totalPages: detalhesResult.totalPages
         });
 
         const finalStats = {
-            produtos: produtosResult,
+            produtosAtivos: produtosAtivosResult,
+            produtosInativos: produtosInativosResult,
             detalhes: detalhesResult,
-            totalRecords: produtosResult.totalRecordsProcessed + detalhesResult.totalRecordsProcessed
+            totalRecords: produtosAtivosResult.totalRecordsProcessed + produtosInativosResult.totalRecordsProcessed + detalhesResult.totalRecordsProcessed
         };
 
         if (metrics) {
