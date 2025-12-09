@@ -260,50 +260,80 @@ async function syncRecentData(url, body, limit = 100, stepName = 'unknown') {
 // Steps Diários
 // =========================
 
-async function step1_syncUltimosProdutos(empresa_id, access_token, refresh_token) {
+async function step1_syncUltimosProdutos(empresa_id, access_token, refresh_token, paginaAtual = 1) {
     const stepName = 'produtos';
     const logger = createSyncContext(empresa_id, 'daily', stepName);
     const metrics = getSyncMetrics(empresa_id, 'daily');
 
-    logOperationStart(`daily-${stepName}`, { empresa_id });
-    
+    logOperationStart(`daily-${stepName}`, { empresa_id, paginaAtual });
+
     if (metrics) {
         metrics.startStep(stepName);
     }
 
     try {
-        // Define o intervalo de datas (ontem e hoje)
-        const today = new Date();
-        const yesterday = new Date(today);
-        yesterday.setDate(today.getDate() - SYNC.DAILY_PERIOD_DAYS);
-
-        const data_inicial = formatDate(yesterday);
-        const data_final = formatDate(today);
-
-        logger.info('Iniciando sincronização de últimos produtos', {
+        logger.info('Iniciando sincronização de produtos e detalhes (daily)', {
             stepName,
-            data_inicial,
-            data_final
+            paginaAtual,
+            totalSubSteps: 2
         });
 
-        const url = `${process.env.SUPABASE_URL}/functions/v1/sincronizar_ultimos_produtos`;
-        const body = { 
-            empresa_id: Number(empresa_id), 
-            access_token, 
+        // Sub-etapa 1.1: Sincronizar produtos usando quantidade (< 100 para encerrar)
+        logger.info('Sub-etapa 1.1: Sincronizando produtos', { stepName });
+
+        const produtosResult = await syncWithPagination(
+            `${process.env.SUPABASE_URL}/functions/v1/sync_prod_2`,
+            {
+                empresa_id: Number(empresa_id),
+                access_token: access_token,
+                page: paginaAtual
+            },
+            empresa_id,
             refresh_token,
-            data_inicial, 
-            data_final 
-        };
+            true, // ✅ Controla paginação usando 'quantidade'
+            `${stepName}-sync`
+        );
 
-        const result = await syncRecentData(url, body, 100, stepName);
-        
-        // Delay após última requisição
-        const delayTime = getDelay('pagination');
-        logger.debug('Aplicando delay após última requisição', {
+        logger.info('Sub-etapa 1.1 concluída', {
             stepName,
-            delayTime: `${delayTime}ms`
+            totalRecords: produtosResult.totalRecordsProcessed,
+            totalPages: produtosResult.totalPages
         });
-        await delay(delayTime);
+
+        // Delay entre sub-etapas
+        const miniDelayTime = getDelay('steps', 'mini');
+        logger.debug('Delay entre sub-etapas', {
+            stepName,
+            delayTime: `${miniDelayTime}ms`
+        });
+        await delay(miniDelayTime);
+
+        // Sub-etapa 1.2: Sincronizar detalhes do produto usando next_page
+        logger.info('Sub-etapa 1.2: Sincronizando detalhes dos produtos', { stepName });
+
+        const detalhesResult = await syncWithPagination(
+            `${process.env.SUPABASE_URL}/functions/v1/sync_detalhes_prod`,
+            {
+                empresa_id: Number(empresa_id),
+                access_token: access_token
+            },
+            empresa_id,
+            refresh_token,
+            false, // ✅ Controla paginação usando 'next_page'
+            `${stepName}-detalhes`
+        );
+
+        logger.info('Sub-etapa 1.2 concluída', {
+            stepName,
+            totalRecords: detalhesResult.totalRecordsProcessed,
+            totalPages: detalhesResult.totalPages
+        });
+
+        const finalStats = {
+            produtos: produtosResult,
+            detalhes: detalhesResult,
+            totalRecords: produtosResult.totalRecordsProcessed + detalhesResult.totalRecordsProcessed
+        };
 
         if (metrics) {
             metrics.endStep('completed');
@@ -311,20 +341,15 @@ async function step1_syncUltimosProdutos(empresa_id, access_token, refresh_token
 
         logOperationEnd(`daily-${stepName}`, true, {
             empresa_id,
-            totalRecords: result.totalRecordsProcessed,
-            totalPages: result.totalPages
+            ...finalStats
         });
 
-        logger.info('Sincronização de produtos concluída', {
+        logger.info('Sincronização de produtos concluída com sucesso', {
             stepName,
-            totalRecords: result.totalRecordsProcessed,
-            totalPages: result.totalPages
+            ...finalStats
         });
 
-        return {
-            totalRecords: result.totalRecordsProcessed,
-            totalPages: result.totalPages
-        };
+        return finalStats;
 
     } catch (error) {
         if (metrics) {
@@ -337,7 +362,7 @@ async function step1_syncUltimosProdutos(empresa_id, access_token, refresh_token
             error: error.message
         });
 
-        logError(error, `daily-${stepName}`, { empresa_id });
+        logError(error, `daily-${stepName}`, { empresa_id, paginaAtual });
         throw error;
     }
 }
