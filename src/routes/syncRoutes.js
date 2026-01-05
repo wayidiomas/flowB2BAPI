@@ -227,6 +227,69 @@ router.post("/daily", syncController.syncDaily);
  */
 router.post("/inventory", syncController.syncInventory);
 
+/**
+ * @swagger
+ * /api/sync/nfe-timestamps:
+ *   post:
+ *     summary: Sincroniza os timestamps das notas fiscais de saida
+ *     description: |
+ *       Busca os timestamps de emissao das notas fiscais de saida para cada
+ *       pedido de venda e salva na tabela pedido_venda_timestamp.
+ *       Usado para gerar mapas de calor de vendas por hora/dia da semana.
+ *     tags: [Sincronizacao]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               empresa_id:
+ *                 type: integer
+ *                 description: ID da empresa
+ *                 example: 123
+ *               accessToken:
+ *                 type: string
+ *                 description: Token de acesso do Bling
+ *               refresh_token:
+ *                 type: string
+ *                 description: Token de atualizacao do Bling
+ *             required:
+ *               - empresa_id
+ *               - accessToken
+ *               - refresh_token
+ *     responses:
+ *       202:
+ *         description: Sincronizacao de timestamps iniciada com sucesso
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 message:
+ *                   type: string
+ *                   example: "Sincronizacao de timestamps de NFe iniciada com sucesso. O processo esta em execucao em background."
+ *                 empresa_id:
+ *                   type: integer
+ *                   example: 123
+ *                 statusEndpoint:
+ *                   type: string
+ *                   example: "/api/sync/status/123"
+ *                 cancelEndpoint:
+ *                   type: string
+ *                   example: "/api/sync/cancel/123/nfe-timestamp"
+ *       400:
+ *         description: Parametros invalidos
+ *       409:
+ *         description: Sincronizacao do mesmo tipo ja em andamento
+ *       500:
+ *         description: Erro interno do servidor
+ */
+router.post("/nfe-timestamps", syncController.syncNfeTimestamps);
+
 // ===========================
 // ROTAS DE MONITORAMENTO (NOVAS)
 // ===========================

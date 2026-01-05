@@ -456,17 +456,17 @@ exports.syncDaily = async (req, res) => {
 
 exports.syncInventory = async (req, res) => {
   const logger = createApiContext('sync-inventory', 'POST');
-  
+
   try {
     // Validação de parâmetros
     const validation = SyncRequestValidator.validateCommonParams(req);
-    
+
     if (!validation.isValid) {
       logger.warn('Parâmetros inválidos recebidos', {
         errors: validation.errors,
         body: sanitizeData(req.body)
       });
-      
+
       return SyncResponseManager.sendValidationError(res, validation.errors);
     }
 
@@ -474,14 +474,14 @@ exports.syncInventory = async (req, res) => {
 
     // Verifica conflito de sincronização
     const conflictCheck = checkActiveSyncConflict(empresa_id, 'inventory');
-    
+
     if (conflictCheck.hasConflict) {
       logger.warn('Sincronização já em andamento', {
         empresa_id,
         currentSync: conflictCheck.currentSync
       });
-      
-      return SyncResponseManager.sendErrorResponse(res, 409, 
+
+      return SyncResponseManager.sendErrorResponse(res, 409,
         "Já existe uma sincronização em andamento para esta empresa", {
           empresa_id,
           currentSync: conflictCheck.currentSync
@@ -511,13 +511,83 @@ exports.syncInventory = async (req, res) => {
     });
 
   } catch (error) {
-    logError(error, 'syncInventory', { 
+    logError(error, 'syncInventory', {
       body: sanitizeData(req.body),
-      ip: req.ip 
+      ip: req.ip
     });
-    
-    return SyncResponseManager.sendErrorResponse(res, 500, 
+
+    return SyncResponseManager.sendErrorResponse(res, 500,
       "Erro interno ao iniciar sincronização de estoque", {
+        error: error.message
+      }
+    );
+  }
+};
+
+exports.syncNfeTimestamps = async (req, res) => {
+  const logger = createApiContext('sync-nfe-timestamps', 'POST');
+
+  try {
+    // Validacao de parametros
+    const validation = SyncRequestValidator.validateCommonParams(req);
+
+    if (!validation.isValid) {
+      logger.warn('Parametros invalidos recebidos', {
+        errors: validation.errors,
+        body: sanitizeData(req.body)
+      });
+
+      return SyncResponseManager.sendValidationError(res, validation.errors);
+    }
+
+    const { empresa_id, accessToken, refresh_token } = validation.params;
+
+    // Verifica conflito de sincronizacao
+    const conflictCheck = checkActiveSyncConflict(empresa_id, 'nfe-timestamp');
+
+    if (conflictCheck.hasConflict) {
+      logger.warn('Sincronizacao ja em andamento', {
+        empresa_id,
+        currentSync: conflictCheck.currentSync
+      });
+
+      return SyncResponseManager.sendErrorResponse(res, 409,
+        "Ja existe uma sincronizacao de timestamps de NFe em andamento para esta empresa", {
+          empresa_id,
+          currentSync: conflictCheck.currentSync
+        }
+      );
+    }
+
+    logger.info('Iniciando sincronizacao de timestamps de NFe', {
+      empresa_id,
+      ip: req.ip,
+      userAgent: req.get('User-Agent')
+    });
+
+    // Responde imediatamente
+    SyncResponseManager.sendAcceptedResponse(res, 'de timestamps de NFe', empresa_id, {
+      statusEndpoint: `/api/sync/status/${empresa_id}`,
+      cancelEndpoint: `/api/sync/cancel/${empresa_id}/nfe-timestamp`
+    });
+
+    // Processa em background
+    setImmediate(async () => {
+      await executeBackgroundSync(
+        syncService.handleNfeTimestampSync,
+        { empresa_id, accessToken, refresh_token },
+        'nfe-timestamp'
+      );
+    });
+
+  } catch (error) {
+    logError(error, 'syncNfeTimestamps', {
+      body: sanitizeData(req.body),
+      ip: req.ip
+    });
+
+    return SyncResponseManager.sendErrorResponse(res, 500,
+      "Erro interno ao iniciar sincronizacao de timestamps de NFe", {
         error: error.message
       }
     );
@@ -600,9 +670,9 @@ exports.cancelSync = async (req, res) => {
       );
     }
 
-    if (!syncType || !['first-time', 'daily', 'inventory'].includes(syncType)) {
-      return SyncResponseManager.sendErrorResponse(res, 400, 
-        "syncType deve ser: first-time, daily ou inventory"
+    if (!syncType || !['first-time', 'daily', 'inventory', 'nfe-timestamp'].includes(syncType)) {
+      return SyncResponseManager.sendErrorResponse(res, 400,
+        "syncType deve ser: first-time, daily, inventory ou nfe-timestamp"
       );
     }
 

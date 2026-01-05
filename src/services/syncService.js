@@ -4,6 +4,7 @@ const { getValidBlingToken } = require("./blingTokenService");
 const { executeSteps } = require("./stepService"); // Fluxo completo (first-time)
 const { executeDailySync } = require("./dailySyncService"); // Fluxo diário
 const { executeInventorySync } = require("./inventorySyncService"); // Fluxo de estoque
+const { executeNfeTimestampSync } = require("./nfeTimestampSyncService"); // Fluxo de timestamps de NFe
 const { startSync, finishSync, getSyncMetrics } = require("./metricsService");
 const { 
   createSyncContext, 
@@ -418,6 +419,47 @@ async function handleInventorySync({ empresa_id, accessToken, refresh_token }) {
 }
 
 /**
+ * Fluxo para sincronizacao de timestamps de NFe.
+ * Esse fluxo busca os timestamps de emissao das notas fiscais de saida
+ * para popular a tabela pedido_venda_timestamp (usada para mapa de calor).
+ */
+async function handleNfeTimestampSync({ empresa_id, accessToken, refresh_token }) {
+  const syncManager = new SyncOperationManager(empresa_id, 'nfe-timestamp', 'timestamp-sync');
+
+  try {
+    // Inicia operacao
+    syncManager.start();
+
+    // Obtem token valido
+    const token = await syncManager.getValidToken(accessToken, refresh_token);
+
+    // Executa sincronizacao com timeout
+    const result = await syncManager.executeWithTimeout(async () => {
+      return await executeNfeTimestampSync(empresa_id, token, refresh_token);
+    }, 'total');
+
+    // Finaliza com sucesso
+    syncManager.finish(true, result);
+
+    return {
+      ...result,
+      metrics: syncManager.getCurrentMetrics()?.getReport()
+    };
+
+  } catch (error) {
+    // Finaliza com erro
+    syncManager.finish(false, null, error);
+
+    return {
+      success: false,
+      message: "Erro durante a sincronizacao de timestamps de NFe",
+      error: error.message || "Erro desconhecido",
+      metrics: syncManager.getCurrentMetrics()?.getReport()
+    };
+  }
+}
+
+/**
  * Obtém status de todas as sincronizações ativas de uma empresa
  */
 function getSyncStatus(empresa_id) {
@@ -563,13 +605,14 @@ module.exports = {
   handleFirstTimeFromStep, // ✨ Nova função
   handleDailySync,
   handleInventorySync,
-  
+  handleNfeTimestampSync, // Sync de timestamps de NFe
+
   // Novas funcionalidades de monitoramento
   getSyncStatus,
   getAllActiveSyncs,
   cancelSync,
   getSyncPerformanceHistory,
-  
+
   // Classe utilitária (para casos avançados)
   SyncOperationManager
 };
