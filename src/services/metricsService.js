@@ -700,14 +700,15 @@ module.exports = {
   Metric,
   SyncMetrics,
   MetricsManager,
-  
+
   // Instância singleton
   metricsManager,
-  
+
   // Funções convenientes
   startSync: (empresa_id, syncType, operation) => metricsManager.startSync(empresa_id, syncType, operation),
-  finishSync: (empresa_id, status) => metricsManager.finishSync(empresa_id, status),
-  getSyncMetrics: (empresa_id) => metricsManager.getSyncMetrics(empresa_id),
+  finishSync: (empresa_id, syncType, status) => metricsManager.finishSync(empresa_id, syncType, status),
+  getSyncMetrics: (empresa_id, syncType) => metricsManager.getSyncMetrics(empresa_id, syncType),
+  getCompanySyncMetrics: (empresa_id) => metricsManager.getCompanySyncMetrics(empresa_id),
   getGlobalMetrics: () => metricsManager.getGlobalMetrics(),
   getHealthCheck: () => metricsManager.getHealthCheck(),
 };
