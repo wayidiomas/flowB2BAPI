@@ -45,18 +45,19 @@ async function syncNfeTimestampBatch(empresa_id, access_token, pedidos) {
 
     logger.debug('Processando batch de timestamps de NFe', {
         batchSize: pedidos.length,
-        pedidoIds: pedidos.map(p => p.pedido_venda_id).slice(0, 5)
+        pedidoIds: pedidos.map(p => p.pedido_id).slice(0, 5)
     });
 
     // Chama a Edge Function com o batch de pedidos
+    // NOTA: A RPC retorna pedido_id e nota_fiscal_id, mas a Edge Function espera pedido_venda_id e nfe_bling_id
     const result = await callEdgeFunction(
         `${process.env.SUPABASE_URL}/functions/v1/sync_nfe_timestamp`,
         {
             empresa_id: Number(empresa_id),
             access_token,
             pedidos: pedidos.map(p => ({
-                pedido_venda_id: p.pedido_venda_id,
-                nfe_bling_id: p.nfe_bling_id
+                pedido_venda_id: p.pedido_id,        // RPC retorna pedido_id
+                nfe_bling_id: p.nota_fiscal_id       // RPC retorna nota_fiscal_id
             }))
         },
         empresa_id,
@@ -112,14 +113,14 @@ async function syncNfeTimestamps(empresa_id, access_token, refresh_token) {
             // Processa o batch
             const result = await syncNfeTimestampBatch(empresa_id, access_token, pedidosPendentes);
 
-            // Conta resultados
+            // Conta resultados (Edge Function retorna: success, errors, results)
             totalBatchesProcessed++;
-            totalRecordsProcessed += result?.processed || 0;
-            totalErrors += result?.errors?.length || 0;
+            totalRecordsProcessed += result?.success || 0;
+            totalErrors += result?.errors || 0;
 
             // Registra progresso nas metricas
             if (metrics) {
-                metrics.pageProcessed(totalBatchesProcessed, result?.processed || 0);
+                metrics.pageProcessed(totalBatchesProcessed, result?.success || 0);
             }
 
             // Log de progresso
@@ -131,8 +132,8 @@ async function syncNfeTimestamps(empresa_id, access_token, refresh_token) {
             logger.info('Batch de timestamps processado', {
                 stepName,
                 batch: totalBatchesProcessed,
-                recordsInBatch: result?.processed || 0,
-                errorsInBatch: result?.errors?.length || 0,
+                recordsInBatch: result?.success || 0,
+                errorsInBatch: result?.errors || 0,
                 totalRecords: totalRecordsProcessed
             });
 
