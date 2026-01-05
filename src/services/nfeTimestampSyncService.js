@@ -5,7 +5,7 @@ const delay = require("../utils/delay");
 const { getValidBlingToken } = require("./blingTokenService");
 const { callEdgeFunction } = require("./edgeFunctionService");
 const { getSyncMetrics } = require("./metricsService");
-const { createClient } = require("@supabase/supabase-js");
+const supabaseService = require("./supabaseService");
 const {
     createSyncContext,
     logOperationStart,
@@ -13,12 +13,6 @@ const {
     logError,
     logPaginationProgress
 } = require("../utils/logger");
-
-// Cliente Supabase para consultar pedidos pendentes
-const supabase = createClient(
-    process.env.SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_ROLE_KEY
-);
 
 // Configuracoes do sync
 const BATCH_SIZE = 50; // Quantidade de pedidos por batch
@@ -29,9 +23,11 @@ const DELAY_BETWEEN_BATCHES = 2000; // 2 segundos entre batches
  * (pedidos com nota_fiscal_id que ainda nao estao na tabela pedido_venda_timestamp)
  */
 async function getPedidosPendentesTimestamp(empresaId, limit = 100) {
-    const { data, error } = await supabase.rpc('get_pedidos_pendentes_timestamp', {
-        p_empresa_id: empresaId,
-        p_limit: limit
+    const { data, error } = await supabaseService.executeQuery(async (client) => {
+        return client.rpc('get_pedidos_pendentes_timestamp', {
+            p_empresa_id: empresaId,
+            p_limit: limit
+        });
     });
 
     if (error) {
