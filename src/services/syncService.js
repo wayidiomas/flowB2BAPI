@@ -94,21 +94,38 @@ class SyncOperationManager {
    */
   async getValidToken(accessToken, refresh_token) {
     this.logger.debug('Obtendo token válido');
-    
+
     try {
       const token = await getValidBlingToken(this.empresa_id, accessToken, refresh_token);
-      
+
       this.logger.info('Token válido obtido', {
         tokenPreview: `${token.substring(0, 8)}***`
       });
-      
+
       return token;
     } catch (error) {
-      logError(error, 'getValidToken', { 
+      logError(error, 'getValidToken', {
         empresa_id: this.empresa_id,
         hasAccessToken: !!accessToken,
         hasRefreshToken: !!refresh_token
       });
+
+      // ✅ CORREÇÃO: Detectar token revogado e parar sync gracefully
+      if (error.isRevoked) {
+        this.logger.error('Token revogado - sincronização cancelada', {
+          operation: 'getValidToken',
+          empresa_id: this.empresa_id,
+          message: 'Usuário precisa reautorizar no Bling'
+        });
+
+        // Criar erro específico para token revogado
+        const revokedError = new Error(`Sincronização cancelada: Token revogado para empresa ${this.empresa_id}. Reautorização necessária.`);
+        revokedError.isRevoked = true;
+        revokedError.empresa_id = this.empresa_id;
+        revokedError.code = 'TOKEN_REVOKED';
+        throw revokedError;
+      }
+
       throw error;
     }
   }

@@ -491,15 +491,15 @@ class TokenManager {
     async _performRenewal(empresa_id, refresh_token) {
         const logger = createTokenContext(empresa_id);
         const startTime = Date.now();
-        
-        logOperationStart('tokenRenewal', { 
+
+        logOperationStart('tokenRenewal', {
             empresa_id,
             refreshTokenPreview: refresh_token ? `${refresh_token.substring(0, 8)}***` : null
         });
 
         try {
             await waitForToken(empresa_id);
-            
+
             logger.info('Iniciando renovação de token', {
                 operation: 'performRenewal'
             });
@@ -537,7 +537,7 @@ class TokenManager {
             this._updateStats(true, renewalTime);
 
             const tokenResult = { access_token, refresh_token: new_refresh_token, expires_at };
-            
+
             logOperationEnd('tokenRenewal', true, {
                 empresa_id,
                 renewalTime: `${renewalTime}ms`,
@@ -558,10 +558,47 @@ class TokenManager {
                 error: error.message
             });
 
-            logError(error, 'performRenewal', { 
+            logError(error, 'performRenewal', {
                 empresa_id,
                 refreshTokenProvided: !!refresh_token
             });
+
+            // ✅ CORREÇÃO: Se erro 400, refresh_token é inválido - marcar para reautorização
+            if (error.response?.status === 400 || error.status === 400) {
+                logger.error('Refresh token inválido (400) - marcando para reautorização', {
+                    operation: 'performRenewal',
+                    empresa_id,
+                    hint: 'Usuário precisa reautorizar no Bling'
+                });
+
+                // Marcar is_revoke = true no banco para forçar reautorização
+                try {
+                    await supabase
+                        .from('bling_tokens')
+                        .update({ is_revoke: true })
+                        .eq('empresa_id', empresa_id);
+
+                    logger.info('Token marcado como revogado - reautorização necessária', {
+                        operation: 'performRenewal',
+                        empresa_id
+                    });
+                } catch (dbError) {
+                    logger.error('Erro ao marcar token como revogado', {
+                        operation: 'performRenewal',
+                        empresa_id,
+                        error: dbError.message
+                    });
+                }
+
+                // Limpar agendamento de renovação para esta empresa
+                this.clearRenewal(empresa_id);
+
+                // Criar erro mais descritivo mas NÃO crashar o servidor
+                const revokeError = new Error(`Token refresh inválido para empresa ${empresa_id}. Reautorização necessária.`);
+                revokeError.isRevoked = true;
+                revokeError.empresa_id = empresa_id;
+                throw revokeError;
+            }
 
             throw error;
         }
@@ -569,7 +606,7 @@ class TokenManager {
 
     _scheduleRenewal(empresa_id, refresh_token, timeUntilExpiry) {
         const logger = createTokenContext(empresa_id);
-        
+
         if (!timeUntilExpiry || timeUntilExpiry <= 0 || !isFinite(timeUntilExpiry)) {
             logger.error('timeUntilExpiry inválido, não agendando renovação', {
                 operation: 'scheduleRenewal',
@@ -577,26 +614,47 @@ class TokenManager {
             });
             return;
         }
-        
+
         this.clearRenewal(empresa_id);
 
         const renewalTime = Math.max(
-            timeUntilExpiry - this.TOKEN_EXPIRATION_BUFFER, 
+            timeUntilExpiry - this.TOKEN_EXPIRATION_BUFFER,
             RENEWAL_GRACE_PERIOD
         );
-        
+
         logger.info('Agendando renovação automática', {
             operation: 'scheduleRenewal',
             renewalInMinutes: Math.round(renewalTime / 1000 / 60)
         });
-        
-        const intervalId = setTimeout(async () => {
-            try {
-                await this._renewToken(empresa_id, refresh_token);
-            } catch (error) {
-                logError(error, 'scheduledRenewal', { empresa_id });
-                this.clearRenewal(empresa_id);
-            }
+
+        // ✅ CORREÇÃO: Usar função não-async para evitar unhandled rejection
+        const intervalId = setTimeout(() => {
+            this._renewToken(empresa_id, refresh_token)
+                .then(() => {
+                    logger.debug('Renovação agendada concluída com sucesso', {
+                        operation: 'scheduledRenewal',
+                        empresa_id
+                    });
+                })
+                .catch((error) => {
+                    // ✅ IMPORTANTE: Erro é capturado aqui e NÃO propaga
+                    logger.error('Erro na renovação agendada', {
+                        operation: 'scheduledRenewal',
+                        empresa_id,
+                        error: error.message,
+                        isRevoked: error.isRevoked || false
+                    });
+
+                    // Se token foi revogado, não tentar novamente
+                    if (error.isRevoked) {
+                        logger.warn('Token revogado - não reagendando renovação', {
+                            operation: 'scheduledRenewal',
+                            empresa_id
+                        });
+                    }
+
+                    this.clearRenewal(empresa_id);
+                });
         }, renewalTime);
 
         this.renewalIntervals.set(empresa_id, intervalId);
