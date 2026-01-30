@@ -61,6 +61,9 @@ class TokenManager {
 
         // Inicia limpeza automática de mutex travados
         this._startMutexCleanupTimer();
+
+        // Recupera tokens do banco no startup (com delay para Supabase conectar)
+        setTimeout(() => this._recoverTokensOnStartup(), 5000);
     }
 
     /**
@@ -85,6 +88,82 @@ class TokenManager {
         } catch (error) {
             this.logger.error('❌ Erro crítico na validação do Supabase', {
                 operation: 'validateSupabaseConnection',
+                error: error.message
+            });
+        }
+    }
+
+    /**
+     * Recupera tokens do banco no startup e agenda renovações proativas.
+     * Resolve o problema do Render.com matar setTimeouts ao dormir.
+     */
+    async _recoverTokensOnStartup() {
+        try {
+            if (!supabase) {
+                this.logger.warn('Supabase indisponível no startup, recovery adiado');
+                return;
+            }
+
+            const { data: tokens, error } = await supabase
+                .from('bling_tokens')
+                .select('empresa_id, access_token, refresh_token, expires_at, is_revoke')
+                .or('is_revoke.is.null,is_revoke.eq.false');
+
+            if (error) {
+                this.logger.error('Erro ao recuperar tokens no startup', {
+                    operation: 'recoverTokensOnStartup',
+                    error: error.message
+                });
+                return;
+            }
+
+            if (!tokens || tokens.length === 0) {
+                this.logger.info('Nenhum token ativo encontrado no startup');
+                return;
+            }
+
+            this.logger.info(`Recuperando ${tokens.length} token(s) no startup`, {
+                operation: 'recoverTokensOnStartup',
+                empresas: tokens.map(t => t.empresa_id)
+            });
+
+            for (const token of tokens) {
+                try {
+                    if (!token.access_token || !token.refresh_token || !token.expires_at) {
+                        this.logger.warn(`Token incompleto para empresa ${token.empresa_id}, pulando`);
+                        continue;
+                    }
+
+                    const timeUntilExpiry = this._getTimeUntilExpiry(token.expires_at);
+
+                    if (timeUntilExpiry > this.TOKEN_EXPIRATION_BUFFER) {
+                        // Token ainda válido — apenas agendar renovação
+                        this._scheduleRenewal(token.empresa_id, token.refresh_token, timeUntilExpiry);
+                        this.logger.info(`Empresa ${token.empresa_id}: renovação agendada (expira em ${Math.round(timeUntilExpiry / 1000 / 60)}min)`);
+                    } else {
+                        // Token expirado ou próximo — renovar imediatamente
+                        this.logger.info(`Empresa ${token.empresa_id}: token expirado/próximo, renovando agora`);
+                        this._renewToken(token.empresa_id, token.refresh_token)
+                            .then(() => {
+                                this.logger.info(`Empresa ${token.empresa_id}: renovação no startup concluída`);
+                            })
+                            .catch((err) => {
+                                this.logger.error(`Empresa ${token.empresa_id}: falha na renovação no startup`, {
+                                    error: err.message,
+                                    isRevoked: err.isRevoked || false
+                                });
+                            });
+                    }
+                } catch (tokenError) {
+                    this.logger.error(`Erro ao processar token da empresa ${token.empresa_id}`, {
+                        operation: 'recoverTokensOnStartup',
+                        error: tokenError.message
+                    });
+                }
+            }
+        } catch (error) {
+            this.logger.error('Erro geral na recuperação de tokens no startup', {
+                operation: 'recoverTokensOnStartup',
                 error: error.message
             });
         }
@@ -159,8 +238,9 @@ class TokenManager {
                     hasToken: !!tokenData,
                     hasExpiresAt: !!tokenData?.expires_at
                 });
-                
-                return await this._renewToken(empresa_id, refresh_token || tokenData?.refresh_token);
+
+                // DB tem prioridade (sempre mais atual que o parâmetro da request)
+                return await this._renewToken(empresa_id, tokenData?.refresh_token || refresh_token);
             }
 
             // ✅ VALIDAÇÃO MELHORADA: Verifica se token é válido
@@ -274,99 +354,94 @@ class TokenManager {
     }
 
     /**
-     * ✅ FUNÇÃO COMPLETAMENTE CORRIGIDA: Salva token com validação do Supabase
+     * Salva token no banco com retry e reset de is_revoke
+     * 3 tentativas com backoff exponencial (1s, 2s, 4s)
      */
     async _saveTokenToDB(empresa_id, access_token, refresh_token, expires_at) {
         const logger = createTokenContext(empresa_id);
-        
-        try {
-            // ✅ VALIDAÇÃO PRÉVIA: Verifica se Supabase está disponível
-            if (!supabase) {
-                throw new Error('Cliente Supabase não está disponível');
-            }
+        const MAX_RETRIES = 3;
 
-            // ✅ NORMALIZAÇÃO: Converte para timestamp UTC consistente
-            const normalizedExpiresAt = new Date(expires_at).toISOString();
-            
-            logger.debug('Salvando token no banco', {
-                operation: 'saveTokenToDB',
-                expiresAt: normalizedExpiresAt,
-                tokenPreview: `${access_token.substring(0, 8)}***`
-            });
-            
-            // ✅ CORREÇÃO CRÍTICA: Usa o Supabase corrigido
-            const { data, error } = await supabase.from("bling_tokens").upsert(
-                {
-                    empresa_id,
-                    access_token,
-                    refresh_token,
-                    expires_at: normalizedExpiresAt,
-                    updated_at: new Date().toISOString()
-                },
-                { 
-                    onConflict: ["empresa_id"],
-                    returning: "minimal"
+        for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                if (!supabase) {
+                    throw new Error('Cliente Supabase não está disponível');
                 }
-            );
 
-            if (error) {
-                logger.error('Erro detalhado do Supabase ao salvar token', {
+                const normalizedExpiresAt = new Date(expires_at).toISOString();
+
+                logger.debug('Salvando token no banco', {
                     operation: 'saveTokenToDB',
-                    supabaseError: {
-                        message: error.message,
-                        details: error.details || 'N/A',
-                        hint: error.hint || 'N/A',
-                        code: error.code || 'N/A'
-                    },
-                    empresa_id,
-                    hasSupabaseClient: !!supabase
+                    attempt,
+                    expiresAt: normalizedExpiresAt,
+                    tokenPreview: `${access_token.substring(0, 8)}***`
                 });
-                throw error;
-            }
-            
-            // ✅ VALIDAÇÃO MELHORADA: Compara timestamps numericamente
-            const savedToken = await this._getTokenFromDB(empresa_id);
-            if (!savedToken) {
-                throw new Error('Token não foi encontrado após salvamento');
-            }
-            
-            // ✅ COMPARAÇÃO ROBUSTA: Converte ambas as datas para timestamp
-            const expectedTime = new Date(expires_at).getTime();
-            const savedTime = new Date(savedToken.expires_at).getTime();
-            const timeDiff = Math.abs(expectedTime - savedTime);
-            
-            // ✅ TOLERÂNCIA AUMENTADA: Aceita diferenças menores que 5 segundos
-            if (timeDiff > DATE_COMPARISON_TOLERANCE) {
-                throw new Error(`Token timestamp inválido: diferença de ${timeDiff}ms excede tolerância de ${DATE_COMPARISON_TOLERANCE}ms`);
-            }
-            
-            logger.debug('Token salvo e validado com sucesso', {
-                operation: 'saveTokenToDB',
-                expectedTime: new Date(expectedTime).toISOString(),
-                savedTime: new Date(savedTime).toISOString(),
-                timeDifference: `${timeDiff}ms`,
-                validated: true
-            });
-            
-        } catch (error) {
-            // ✅ LOG DETALHADO PARA TROUBLESHOOTING
-            logger.error('Erro crítico ao salvar token no banco', {
-                operation: 'saveTokenToDB',
-                error: error.message,
-                errorCode: error.code || 'N/A',
-                errorDetails: error.details || 'N/A',
-                errorHint: error.hint || 'N/A',
-                empresa_id,
-                hasSupabaseClient: !!supabase,
-                expiresAt: expires_at?.toISOString?.() || expires_at
-            });
 
-            logError(error, 'saveTokenToDB', { 
-                empresa_id,
-                expiresAt: expires_at?.toISOString?.() || expires_at,
-                supabaseAvailable: !!supabase
-            });
-            throw error;
+                const { data, error } = await supabase.from("bling_tokens").upsert(
+                    {
+                        empresa_id,
+                        access_token,
+                        refresh_token,
+                        expires_at: normalizedExpiresAt,
+                        updated_at: new Date().toISOString(),
+                        is_revoke: false  // Reset flag ao salvar tokens válidos
+                    },
+                    {
+                        onConflict: ["empresa_id"],
+                        returning: "minimal"
+                    }
+                );
+
+                if (error) {
+                    logger.error('Erro do Supabase ao salvar token', {
+                        operation: 'saveTokenToDB',
+                        attempt,
+                        supabaseError: {
+                            message: error.message,
+                            details: error.details || 'N/A',
+                            hint: error.hint || 'N/A',
+                            code: error.code || 'N/A'
+                        },
+                        empresa_id
+                    });
+                    throw error;
+                }
+
+                logger.debug('Token salvo com sucesso', {
+                    operation: 'saveTokenToDB',
+                    attempt,
+                    expiresAt: normalizedExpiresAt
+                });
+
+                return; // Sucesso — sai do loop
+
+            } catch (error) {
+                logger.error(`Erro ao salvar token (tentativa ${attempt}/${MAX_RETRIES})`, {
+                    operation: 'saveTokenToDB',
+                    attempt,
+                    error: error.message,
+                    errorCode: error.code || 'N/A',
+                    empresa_id
+                });
+
+                if (attempt === MAX_RETRIES) {
+                    logError(error, 'saveTokenToDB', {
+                        empresa_id,
+                        expiresAt: expires_at?.toISOString?.() || expires_at,
+                        supabaseAvailable: !!supabase,
+                        allRetriesFailed: true
+                    });
+                    throw error;
+                }
+
+                // Backoff exponencial: 1s, 2s, 4s
+                const backoffMs = Math.pow(2, attempt - 1) * 1000;
+                logger.warn(`Retry saveTokenToDB em ${backoffMs}ms...`, {
+                    operation: 'saveTokenToDB',
+                    attempt,
+                    nextAttempt: attempt + 1
+                });
+                await new Promise(resolve => setTimeout(resolve, backoffMs));
+            }
         }
     }
 
@@ -528,7 +603,22 @@ class TokenManager {
             const { access_token, refresh_token: new_refresh_token, expires_in } = result;
             const expires_at = new Date(Date.now() + expires_in * 1000);
 
-            await this._saveTokenToDB(empresa_id, access_token, new_refresh_token, expires_at);
+            // PROTEÇÃO CRÍTICA: Bling já invalidou o refresh_token antigo neste ponto.
+            // Se o save falhar, logamos os novos tokens para recovery manual.
+            try {
+                await this._saveTokenToDB(empresa_id, access_token, new_refresh_token, expires_at);
+            } catch (saveError) {
+                logger.error('CRITICAL: Falha ao salvar tokens após refresh bem-sucedido do Bling', {
+                    operation: 'performRenewal',
+                    empresa_id,
+                    newAccessToken: access_token,
+                    newRefreshToken: new_refresh_token,
+                    expiresAt: expires_at.toISOString(),
+                    saveError: saveError.message,
+                    hint: 'TOKENS ACIMA PRECISAM SER SALVOS MANUALMENTE NO BANCO'
+                });
+                throw saveError;
+            }
 
             const timeUntilExpiry = expires_at.getTime() - Date.now();
             this._scheduleRenewal(empresa_id, new_refresh_token, timeUntilExpiry);

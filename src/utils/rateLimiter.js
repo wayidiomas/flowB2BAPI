@@ -271,10 +271,12 @@ class TokenRateLimiter extends RateLimiter {
    * Registra início de renovação de token
    */
   startTokenRenewal(empresa_id, renewalPromise) {
-    this.renewalQueue.set(empresa_id, renewalPromise);
-    
+    // Silencia rejeição para evitar unhandledRejection crash
+    const silentPromise = renewalPromise.catch(() => {});
+    this.renewalQueue.set(empresa_id, silentPromise);
+
     // Remove da queue quando completar
-    renewalPromise.finally(() => {
+    silentPromise.finally(() => {
       this.renewalQueue.delete(empresa_id);
     });
   }

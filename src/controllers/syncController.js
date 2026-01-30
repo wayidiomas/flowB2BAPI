@@ -1,11 +1,12 @@
 // src/controllers/syncController.js
 const syncService = require("../services/syncService");
-const { 
-  createApiContext, 
-  logError, 
-  logOperationStart, 
+const supabase = require("../services/supabaseService");
+const {
+  createApiContext,
+  logError,
+  logOperationStart,
   logOperationEnd,
-  sanitizeData 
+  sanitizeData
 } = require("../utils/logger");
 
 /**
@@ -402,16 +403,37 @@ exports.syncDaily = async (req, res) => {
 
     const { empresa_id, accessToken, refresh_token } = validation.params;
 
+    // Verificar se first-time sync completou antes de permitir daily
+    const { data: empresa } = await supabase
+      .from('empresas')
+      .select('sync_status')
+      .eq('id', empresa_id)
+      .maybeSingle();
+
+    if (!empresa || empresa.sync_status !== 'completed') {
+      logger.warn('First-time sync não completou, daily sync bloqueado', {
+        empresa_id,
+        syncStatus: empresa?.sync_status || 'unknown'
+      });
+
+      return SyncResponseManager.sendErrorResponse(res, 409,
+        "First-time sync ainda não completou para esta empresa", {
+          empresa_id,
+          currentStatus: empresa?.sync_status || 'unknown'
+        }
+      );
+    }
+
     // Verifica conflito de sincronização
     const conflictCheck = checkActiveSyncConflict(empresa_id, 'daily');
-    
+
     if (conflictCheck.hasConflict) {
       logger.warn('Sincronização já em andamento', {
         empresa_id,
         currentSync: conflictCheck.currentSync
       });
-      
-      return SyncResponseManager.sendErrorResponse(res, 409, 
+
+      return SyncResponseManager.sendErrorResponse(res, 409,
         "Já existe uma sincronização em andamento para esta empresa", {
           empresa_id,
           currentSync: conflictCheck.currentSync
@@ -471,6 +493,27 @@ exports.syncInventory = async (req, res) => {
     }
 
     const { empresa_id, accessToken, refresh_token } = validation.params;
+
+    // Verificar se first-time sync completou antes de permitir inventory
+    const { data: empresaInv } = await supabase
+      .from('empresas')
+      .select('sync_status')
+      .eq('id', empresa_id)
+      .maybeSingle();
+
+    if (!empresaInv || empresaInv.sync_status !== 'completed') {
+      logger.warn('First-time sync não completou, inventory sync bloqueado', {
+        empresa_id,
+        syncStatus: empresaInv?.sync_status || 'unknown'
+      });
+
+      return SyncResponseManager.sendErrorResponse(res, 409,
+        "First-time sync ainda não completou para esta empresa", {
+          empresa_id,
+          currentStatus: empresaInv?.sync_status || 'unknown'
+        }
+      );
+    }
 
     // Verifica conflito de sincronização
     const conflictCheck = checkActiveSyncConflict(empresa_id, 'inventory');

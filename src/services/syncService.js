@@ -6,6 +6,7 @@ const { executeDailySync } = require("./dailySyncService"); // Fluxo diário
 const { executeInventorySync } = require("./inventorySyncService"); // Fluxo de estoque
 const { executeNfeTimestampSync } = require("./nfeTimestampSyncService"); // Fluxo de timestamps de NFe
 const { startSync, finishSync, getSyncMetrics } = require("./metricsService");
+const supabase = require("./supabaseService");
 const { 
   createSyncContext, 
   logOperationStart, 
@@ -289,7 +290,12 @@ async function handleFirstTimeSync({ empresa_id, accessToken, refresh_token, pag
 
     // Finaliza com sucesso
     syncManager.finish(true, result);
-    
+
+    // Marcar first-time sync como concluída
+    await supabase.from('empresas')
+      .update({ sync_status: 'completed' })
+      .eq('id', empresa_id);
+
     return {
       ...result,
       metrics: syncManager.getCurrentMetrics()?.getReport()
@@ -298,10 +304,15 @@ async function handleFirstTimeSync({ empresa_id, accessToken, refresh_token, pag
   } catch (error) {
     // Finaliza com erro
     syncManager.finish(false, null, error);
-    
-    return { 
-      success: false, 
-      message: "Erro durante a sincronização first-time", 
+
+    // Marcar first-time sync como erro
+    await supabase.from('empresas')
+      .update({ sync_status: 'error' })
+      .eq('id', empresa_id);
+
+    return {
+      success: false,
+      message: "Erro durante a sincronização first-time",
       error: error.message || "Erro desconhecido",
       metrics: syncManager.getCurrentMetrics()?.getReport()
     };
@@ -334,7 +345,12 @@ async function handleFirstTimeFromStep({ empresa_id, accessToken, refresh_token,
 
     // Finaliza com sucesso
     syncManager.finish(true, result);
-    
+
+    // Marcar first-time sync como concluída
+    await supabase.from('empresas')
+      .update({ sync_status: 'completed' })
+      .eq('id', empresa_id);
+
     return {
       ...result,
       startFromStep,
@@ -344,10 +360,15 @@ async function handleFirstTimeFromStep({ empresa_id, accessToken, refresh_token,
   } catch (error) {
     // Finaliza com erro
     syncManager.finish(false, null, error);
-    
-    return { 
-      success: false, 
-      message: `Erro durante a sincronização first-time a partir da etapa ${startFromStep}`, 
+
+    // Marcar first-time sync como erro
+    await supabase.from('empresas')
+      .update({ sync_status: 'error' })
+      .eq('id', empresa_id);
+
+    return {
+      success: false,
+      message: `Erro durante a sincronização first-time a partir da etapa ${startFromStep}`,
       error: error.message || "Erro desconhecido",
       startFromStep,
       metrics: syncManager.getCurrentMetrics()?.getReport()
