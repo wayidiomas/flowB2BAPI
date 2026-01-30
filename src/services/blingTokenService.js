@@ -662,13 +662,19 @@ class TokenManager {
                 });
 
                 // Marcar is_revoke = true no banco para forçar reautorização
+                // E resetar sync_status para 'pending' para bloquear crons
                 try {
                     await supabase
                         .from('bling_tokens')
                         .update({ is_revoke: true })
                         .eq('empresa_id', empresa_id);
 
-                    logger.info('Token marcado como revogado - reautorização necessária', {
+                    await supabase
+                        .from('empresas')
+                        .update({ sync_status: 'pending' })
+                        .eq('id', empresa_id);
+
+                    logger.info('Token marcado como revogado e sync_status resetado para pending', {
                         operation: 'performRenewal',
                         empresa_id
                     });
