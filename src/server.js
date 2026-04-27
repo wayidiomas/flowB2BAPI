@@ -26,9 +26,12 @@ const { createRateLimitMiddleware } = require("./utils/rateLimiter");
 // Serviços
 const { clearAllRenewalIntervals } = require("./services/blingTokenService");
 const { getHealthCheck } = require("./services/metricsService");
+const { blingQueueProcessor } = require("./services/blingQueueService");
+const { registerHandlers: registerBlingHandlers } = require("./services/blingHandlers");
 
 // Rotas
 const syncRoutes = require("./routes/syncRoutes");
+const queueRoutes = require("./routes/queueRoutes");
 
 // ===========================
 // INICIALIZAÇÃO DA APLICAÇÃO
@@ -162,6 +165,7 @@ logger.info('✅ Swagger configurado', {
 // ===========================
 
 app.use("/api/sync", syncRoutes);
+app.use("/api/queue", queueRoutes);
 
 // ===========================
 // ROTAS DE SISTEMA E HEALTH CHECK
@@ -353,6 +357,19 @@ function gracefulShutdown(signal) {
                 error: error.message
             });
         }
+
+        // Para o worker da fila Bling
+        try {
+            blingQueueProcessor.stop();
+            logger.info('✅ Worker da fila Bling parado', {
+                service: 'server'
+            });
+        } catch (error) {
+            logger.error('Erro ao parar worker da fila Bling', {
+                service: 'server',
+                error: error.message
+            });
+        }
         
         logOperationEnd('server-shutdown', true, { signal });
         
@@ -440,7 +457,19 @@ const server = app.listen(port, () => {
     console.log(`📜 Documentation: ${process.env.SERVER_URL || `http://localhost:${port}`}/api-docs`);
     console.log(`💚 Health Check: ${process.env.SERVER_URL || `http://localhost:${port}`}/health`);
     console.log(`🔧 Environment: ${ENV.IS_PRODUCTION ? 'production' : 'development'}\n`);
-    
+
+    // Registra handlers da fila Bling antes de iniciar o worker
+    try {
+        registerBlingHandlers();
+        blingQueueProcessor.start();
+        logger.info('✅ Worker da fila Bling iniciado', { service: 'server' });
+    } catch (error) {
+        logger.error('Erro ao iniciar worker da fila Bling', {
+            service: 'server',
+            error: error.message
+        });
+    }
+
     logOperationEnd('server-startup', true, serverInfo);
 });
 
