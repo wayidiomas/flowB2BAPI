@@ -10,11 +10,12 @@ const {
   logOperationEnd,
   sanitizeData 
 } = require("../utils/logger");
-const { 
-  waitForToken, 
+const {
+  waitForToken,
   rateLimiterManager,
-  withBlingRateLimit 
+  withBlingRateLimit
 } = require("../utils/rateLimiter");
+const { logEvent } = require("./auditLogService");
 
 // ===========================
 // CONSTANTES DE CONFIGURAÇÃO
@@ -677,6 +678,16 @@ class TokenManager {
                     logger.info('Token marcado como revogado e sync_status resetado para pending', {
                         operation: 'performRenewal',
                         empresa_id
+                    });
+
+                    // Registra no audit_log pra aparecer no painel do superadmin
+                    await logEvent('critical', 'token_revoked', {
+                        empresa_id,
+                        contexto: {
+                            motivo: 'refresh_token_invalido_400',
+                            hint: 'Usuário precisa reautorizar no Bling',
+                            operation: 'performRenewal'
+                        }
                     });
                 } catch (dbError) {
                     logger.error('Erro ao marcar token como revogado', {
