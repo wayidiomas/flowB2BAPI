@@ -837,8 +837,8 @@ async function etapaNotasFiscais(empresa_id, accessToken, refresh_token) {
         for (const [index, nota] of (chavesList || []).entries()) {
             try {
                 await callEdgeFunction(
-                    `${process.env.SUPABASE_URL}/functions/v1/detalhes_nota_fiscal_chave_acesso`,
-                    { chave_acesso: nota.chave_acesso },
+                    `${process.env.SUPABASE_URL}/functions/v1/detalhes_nota_fiscal_chave_acesso_v2`,
+                    { chave_acesso: nota.chave_acesso, empresa_id: Number(empresa_id) },
                     empresa_id,
                     accessToken,
                     refresh_token,
