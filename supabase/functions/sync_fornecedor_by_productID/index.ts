@@ -134,6 +134,47 @@ const processSupplierDetails = async (access_token: string, empresa_id: number, 
         // Log do codigo do fornecedor recebido do Bling
         console.log(`[INFO] Supplier product code from Bling: ${detail.produtoCodigo || detail.codigo || 'N/A'}`);
 
+        // Le o registro existente para decidir se preservamos `valor_de_compra`.
+        // Quando preco_origem='catalogo', o preco veio do catalogo do fornecedor (fluxo
+        // FlowB2B) e o lojista pode ter optado por nao replicar no Bling — entao o
+        // valor no Bling fica desatualizado de proposito. Sobrescrever aqui zeraria a
+        // intencao do lojista. Atualizamos os demais campos normalmente.
+        const { data: existing, error: fetchExistingError } = await supabase
+          .from('fornecedores_produtos')
+          .select('valor_de_compra, preco_origem')
+          .eq('fornecedor_id', supplierSupabaseId)
+          .eq('produto_id', product.id)
+          .eq('empresa_id', empresa_id)
+          .maybeSingle();
+
+        if (fetchExistingError) {
+          console.error('[ERROR] Error fetching existing fornecedores_produtos:', fetchExistingError);
+        }
+
+        const codigoFornecedor = detail.produtoCodigo || detail.codigo || null;
+        const preservarPreco = existing?.preco_origem === 'catalogo';
+
+        if (preservarPreco) {
+          // UPDATE preservando valor_de_compra
+          const { error: updateError } = await supabase
+            .from('fornecedores_produtos')
+            .update({
+              qtd_ultima_compra: detail.qtdUltimaCompra,
+              precocusto: detail.precoCusto,
+              codigo_fornecedor: codigoFornecedor,
+            })
+            .eq('fornecedor_id', supplierSupabaseId)
+            .eq('produto_id', product.id)
+            .eq('empresa_id', empresa_id);
+
+          if (updateError) {
+            console.error('[ERROR] Error updating supplier-product (preserving valor_de_compra):', updateError);
+          } else {
+            console.log(`[OK] Preserved valor_de_compra (preco_origem=catalogo) for product ID: ${product.id} and supplier ID: ${supplierSupabaseId}; other fields refreshed`);
+          }
+          continue;
+        }
+
         console.log(`[INFO] Upserting supplier-product relationship for product ID: ${product.id} and supplier ID: ${supplierSupabaseId}`);
         const { error: upsertRelationshipError } = await supabase
           .from('fornecedores_produtos')
@@ -145,13 +186,13 @@ const processSupplierDetails = async (access_token: string, empresa_id: number, 
             precocusto: detail.precoCusto,
             empresa_id: empresa_id,
             // NOVO: Salva o codigo do produto no sistema do fornecedor
-            codigo_fornecedor: detail.produtoCodigo || detail.codigo || null,
+            codigo_fornecedor: codigoFornecedor,
           });
 
         if (upsertRelationshipError) {
           console.error('[ERROR] Error upserting supplier-product relationship:', upsertRelationshipError);
         } else {
-          console.log(`[OK] Successfully upserted supplier-product relationship for product ID: ${product.id} and supplier ID: ${supplierSupabaseId} with codigo_fornecedor: ${detail.produtoCodigo || detail.codigo || 'N/A'}`);
+          console.log(`[OK] Successfully upserted supplier-product relationship for product ID: ${product.id} and supplier ID: ${supplierSupabaseId} with codigo_fornecedor: ${codigoFornecedor || 'N/A'}`);
         }
       }
 
